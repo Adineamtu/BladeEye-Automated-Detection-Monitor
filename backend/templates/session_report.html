@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Session Report - {{ name }}</title>
+  <style>
+    body { font-family: sans-serif; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: left; }
+    th { background-color: #f0f0f0; }
+    img { max-width: 100%; }
+  </style>
+</head>
+<body>
+  <h1>Session Report: {{ name }}</h1>
+  <section>
+    <h2>Metadata</h2>
+    <p>Saved: {{ saved_at }}</p>
+    {% if watchlist %}
+    <p>Watchlist: {{ watchlist|join(', ') }}</p>
+    {% endif %}
+  </section>
+  <section>
+    <h2>Signals</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Center Frequency</th>
+          <th>Bandwidth</th>
+          <th>Peak Power</th>
+          <th>Start Time</th>
+          <th>End Time</th>
+          <th>Modulation</th>
+          <th>Baud Rate</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in signals %}
+        <tr>
+          <td>{{ s.center_frequency }}</td>
+          <td>{{ s.bandwidth }}</td>
+          <td>{{ s.peak_power }}</td>
+          <td>{{ s.start_time }}</td>
+          <td>{{ s.end_time }}</td>
+          <td>{{ s.modulation_type }}</td>
+          <td>{{ s.baud_rate }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% if signals %}
+  <section>
+    <h2>Signal Charts</h2>
+    {% for s in signals %}
+    <h3>{{ s.center_frequency }} Hz</h3>
+    {% if s.power_chart %}
+    <h4>Power Over Time</h4>
+    <img src="data:image/png;base64,{{ s.power_chart }}" alt="Power Chart">
+    {% endif %}
+    {% if s.frequency_chart %}
+    <h4>Frequency Over Time</h4>
+    <img src="data:image/png;base64,{{ s.frequency_chart }}" alt="Frequency Chart">
+    {% endif %}
+    {% endfor %}
+  </section>
+  {% endif %}
+  {% if recordings %}
+  <section>
+    <h2>Recordings</h2>
+    <ul>
+      {% for r in recordings %}
+      <li>{{ r.freq }} Hz - <a href="{{ r.path }}" download>{{ r.path }}</a></li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+  {% if waterfall %}
+  <section>
+    <h2>Waterfall Snapshot</h2>
+    <img src="data:image/png;base64,{{ waterfall }}" alt="Waterfall Snapshot">
+  </section>
+  {% endif %}
+</body>
+</html>

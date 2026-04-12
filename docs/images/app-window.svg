@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-label="Reactive Monitor application window preview">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1f2430"/>
+      <stop offset="100%" stop-color="#131722"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="720" fill="url(#bg)"/>
+  <rect x="40" y="40" width="1200" height="640" rx="14" fill="#2b3242" stroke="#5d6a86" stroke-width="2"/>
+  <rect x="40" y="40" width="1200" height="70" rx="14" fill="#3a4358"/>
+  <circle cx="72" cy="74" r="8" fill="#ff5f56"/>
+  <circle cx="98" cy="74" r="8" fill="#ffbd2e"/>
+  <circle cx="124" cy="74" r="8" fill="#27c93f"/>
+  <text x="160" y="80" fill="#d9e2f5" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700">Reactive Monitor — Application Window</text>
+  <g stroke="#46526b" stroke-width="1">
+    <line x1="80" y1="150" x2="1200" y2="150"/>
+    <line x1="80" y1="190" x2="1200" y2="190"/>
+    <line x1="80" y1="230" x2="1200" y2="230"/>
+    <line x1="80" y1="270" x2="1200" y2="270"/>
+    <line x1="80" y1="310" x2="1200" y2="310"/>
+    <line x1="80" y1="350" x2="1200" y2="350"/>
+    <line x1="80" y1="390" x2="1200" y2="390"/>
+    <line x1="80" y1="430" x2="1200" y2="430"/>
+    <line x1="80" y1="470" x2="1200" y2="470"/>
+    <line x1="80" y1="510" x2="1200" y2="510"/>
+    <line x1="80" y1="550" x2="1200" y2="550"/>
+    <line x1="80" y1="590" x2="1200" y2="590"/>
+  </g>
+  <polyline fill="none" stroke="#47d5ff" stroke-width="3" points="80,470 120,460 160,480 200,450 240,440 280,470 320,430 360,420 400,440 440,410 480,395 520,420 560,390 600,405 640,370 680,390 720,360 760,350 800,375 840,340 880,360 920,330 960,345 1000,320 1040,335 1080,310 1120,330 1160,320 1200,325"/>
+  <text x="90" y="640" fill="#9fb0cd" font-family="Arial, Helvetica, sans-serif" font-size="20">Preview image (text-based SVG to keep PR diff fully supported).</text>
+</svg>

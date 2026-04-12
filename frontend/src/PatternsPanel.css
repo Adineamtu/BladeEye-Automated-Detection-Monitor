@@ -1,0 +1,12 @@
+.patterns-panel ul {
+  list-style: none;
+  padding: 0;
+}
+
+.patterns-panel li {
+  margin-bottom: 0.5rem;
+}
+
+.patterns-panel button {
+  margin-left: 0.5rem;
+}

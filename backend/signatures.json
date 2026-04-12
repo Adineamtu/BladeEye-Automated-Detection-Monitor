@@ -1,0 +1,112 @@
+{
+  "signatures": [
+    {
+      "name": "Telecomanda Garaj / Poarta (Standard)",
+      "frequency_range": [433.0, 434.7],
+      "modulation": "ASK",
+      "baud_rate": 1200,
+      "protocol": "EV1527 / PT2262 / HT6P20B",
+      "likely_purpose": "Control acces (Cod Fix)",
+      "label": "Security"
+    },
+    {
+      "name": "Senzor Presiune Roti (TPMS) - Euro",
+      "frequency_range": [433.8, 434.1],
+      "modulation": "FSK",
+      "baud_rate": 9600,
+      "protocol": "Schrader / Toyota / Citroen",
+      "likely_purpose": "Senzor Auto (Presiune Pneuri)",
+      "label": "Automotive"
+    },
+    {
+      "name": "Statie Meteo / Senzor Umiditate",
+      "frequency_range": [433.5, 434.5],
+      "modulation": "ASK",
+      "baud_rate": 2400,
+      "protocol": "FineOffset / Nexus / Oregon Scientific",
+      "likely_purpose": "Meteorologie / Smart Home",
+      "label": "Sensor"
+    },
+    {
+      "name": "Sonerie Wireless",
+      "frequency_range": [433.8, 434.0],
+      "modulation": "ASK",
+      "baud_rate": 1000,
+      "protocol": "Kerui / Doorbell Generic",
+      "likely_purpose": "Anunt intrare",
+      "label": "Home Automation"
+    },
+    {
+      "name": "Contor Apa / Gaz (wM-Bus)",
+      "frequency_range": [868.0, 868.6],
+      "modulation": "FSK",
+      "baud_rate": 16384,
+      "protocol": "Wireless M-Bus (Mode T1/C1)",
+      "likely_purpose": "Telecitire Utilitati",
+      "label": "Infrastructure"
+    },
+    {
+      "name": "Sistem Alarma (Visonic/Honeywell)",
+      "frequency_range": [868.9, 869.2],
+      "modulation": "ASK",
+      "baud_rate": 2400,
+      "protocol": "Visonic PowerCode",
+      "likely_purpose": "Securitate Rezidentiala",
+      "label": "Security"
+    },
+    {
+      "name": "Senzor Fum / Inundatie (Zigbee-Lite)",
+      "frequency_range": [868.0, 868.3],
+      "modulation": "FSK",
+      "baud_rate": 50000,
+      "protocol": "Generic FSK Sensor",
+      "likely_purpose": "Protectie Locuinta",
+      "label": "Safety"
+    },
+    {
+      "name": "Smart Plug / Intrerupator Inteligent",
+      "frequency_range": [433.92, 433.92],
+      "modulation": "ASK",
+      "baud_rate": 4800,
+      "protocol": "Intertechno / Livolo",
+      "likely_purpose": "Control Lumini/Prize",
+      "label": "Home Automation"
+    },
+    {
+      "name": "Cheie Masina (Keyless Entry)",
+      "frequency_range": [433.0, 434.5],
+      "modulation": "FSK",
+      "baud_rate": 10000,
+      "protocol": "Rolling Code (Keeloq)",
+      "likely_purpose": "Acces Vehicul",
+      "label": "Automotive"
+    },
+    {
+      "name": "Avion Transponder (ADS-B)",
+      "frequency_range": [1089.9, 1090.1],
+      "modulation": "Pulse",
+      "baud_rate": 1000000,
+      "protocol": "Mode S / ADS-B",
+      "likely_purpose": "Tracking Avioane",
+      "label": "Aviation"
+    },
+    {
+      "name": "Sistem Monitorizare Bebelusi",
+      "frequency_range": [864.0, 865.0],
+      "modulation": "FM/FSK",
+      "baud_rate": 1200,
+      "protocol": "Analog/Digital Baby Monitor",
+      "likely_purpose": "Audio Monitoring",
+      "label": "Personal"
+    },
+    {
+      "name": "Termostat Centrala Termica",
+      "frequency_rate": [868.3, 868.3],
+      "modulation": "FSK",
+      "baud_rate": 4800,
+      "protocol": "Salus / Honeywell RF",
+      "likely_purpose": "Control Climatizare",
+      "label": "HVAC"
+    }
+  ]
+}

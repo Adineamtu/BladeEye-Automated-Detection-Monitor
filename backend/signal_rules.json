@@ -1,0 +1,14 @@
+[
+  {
+    "center_frequency": [430000000, 440000000],
+    "modulation_type": "FSK",
+    "baud_rate": [900, 1100],
+    "likely_purpose": "Home Automation Sensor"
+  },
+  {
+    "center_frequency": [2400000000, 2500000000],
+    "modulation_type": "PSK",
+    "baud_rate": [1000000, 2000000],
+    "likely_purpose": "WiFi Device"
+  }
+]

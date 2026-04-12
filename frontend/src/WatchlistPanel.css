@@ -1,0 +1,19 @@
+.watchlist-panel {
+  margin: 1rem 0;
+}
+
+.watchlist-panel ul {
+  list-style: none;
+  padding: 0;
+}
+
+.watchlist-panel li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 0.25rem 0;
+}
+
+.watchlist-panel input {
+  margin-right: 0.5rem;
+}

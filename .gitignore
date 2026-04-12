@@ -1,0 +1,8 @@
+__pycache__/
+node_modules/
+frontend/node_modules/
+.pytest_cache/
+build/
+dist/
+*.spec
+frontend/dist/
