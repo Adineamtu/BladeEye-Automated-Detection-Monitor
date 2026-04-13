@@ -1,6 +1,6 @@
 #include "ring_buffer.h"
 #include "shm_layout.h"
-#include <fcntl.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -8,6 +8,7 @@
 #include <cmath>
 #include <complex>
 #include <csignal>
+#include <fcntl.h>
 #include <cstring>
 #include <fftw3.h>
 #include <iostream>
