@@ -9,6 +9,7 @@
 #include <complex>
 #include <csignal>
 #include <fcntl.h>
+#include <sys/types.h>
 #include <cstring>
 #include <fftw3.h>
 #include <iostream>
