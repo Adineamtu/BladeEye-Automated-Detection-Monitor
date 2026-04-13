@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_DIR = ROOT / "frontend"
 CPP_DIR = ROOT / "cpp" / "sdr_core"
 CPP_BUILD_DIR = CPP_DIR / "build"
-SPEC_FILE = APP_WRAPPER_DIR / "blade_eye.spec"
+SPEC_FILE = APP_WRAPPER_DIR / "reactive_jam.spec"
 DIST_DIR = ROOT / "dist"
 RELEASE_DIR = ROOT / "release"
 
