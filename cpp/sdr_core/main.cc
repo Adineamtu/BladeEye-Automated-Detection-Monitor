@@ -1,6 +1,5 @@
 #include "ring_buffer.h"
 #include "shm_layout.h"
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -8,9 +7,8 @@
 #include <cmath>
 #include <complex>
 #include <csignal>
-#include <fcntl.h>
-#include <sys/types.h>
 #include <cstring>
+#include <fcntl.h>
 #include <fftw3.h>
 #include <iostream>
 #include <mutex>
@@ -26,6 +24,8 @@
 #include <unistd.h>
 #include <vector>
 #include <ctime>
+
+// BladeEye Core - SHM fix applied
 
 namespace {
 
