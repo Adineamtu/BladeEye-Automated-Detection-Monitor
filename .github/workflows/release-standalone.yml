@@ -39,6 +39,20 @@ jobs:
       - name: Build standalone package
         run: python app_wrapper/build_standalone.py
 
+      # --- ACESTA ESTE PASUL NOU CARE LIPSEA ---
+      - name: Prepare Artifacts for Release
+        run: |
+          # Verificăm unde a pus PyInstaller fișierele (de obicei în app_wrapper/dist)
+          # Creăm arhiva din conținutul folderului dist
+          if [ -d "app_wrapper/dist" ]; then
+            cd app_wrapper/dist && tar -czvf ../../reactive_jam_standalone.tar.gz .
+          elif [ -d "dist" ]; then
+            cd dist && tar -czvf ../reactive_jam_standalone.tar.gz .
+          else
+            echo "EROARE: Folderul dist nu a fost gasit!"
+            exit 1
+          fi
+
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
