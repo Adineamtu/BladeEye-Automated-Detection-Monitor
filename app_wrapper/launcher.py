@@ -9,11 +9,13 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Iterable
 
 import requests
+import uvicorn
 
 try:
     import tkinter as tk
@@ -23,6 +25,7 @@ except Exception:  # pragma: no cover
     messagebox = None
 
 import webview
+from api import app
 
 WINDOW_TITLE = "Reactive Jamming Monitor"
 DEFAULT_HOST = "127.0.0.1"
@@ -103,16 +106,6 @@ def _show_error_dialog(message: str, title: str = "Reactive Jamming") -> None:
     root.destroy()
 
 
-def _start_process(cmd: list[str], env: dict[str, str] | None = None) -> subprocess.Popen:
-    return subprocess.Popen(
-        cmd,
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=_silent_creation_flags(),
-    )
-
-
 def _wait_for_api(base_url: str, timeout_s: float = 20.0) -> None:
     deadline = time.time() + timeout_s
     last_error: Exception | None = None
@@ -153,39 +146,29 @@ def run() -> int:
     api_url = f"http://{args.api_host}:{api_port}"
 
     core_proc: subprocess.Popen | None = None
-    api_proc: subprocess.Popen | None = None
-
     try:
         frontend_dist = _resolve_frontend_dist()
         if not args.no_core:
             core_binary = _resolve_binary("sdr_core")
-            core_proc = _start_process([str(core_binary)])
+            core_proc = subprocess.Popen(
+                [str(core_binary)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=_silent_creation_flags(),
+            )
 
         launcher_env = os.environ.copy()
         launcher_env["FRONTEND_DIST"] = str(frontend_dist)
+        os.environ.update(launcher_env)
 
-        root = _resource_root()
-        api_cmd = [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "api:app",
-            "--host",
-            args.api_host,
-            "--port",
-            str(api_port),
-        ]
-        api_proc = subprocess.Popen(
-            api_cmd,
-            env=launcher_env,
-            cwd=str(root),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=_silent_creation_flags(),
-        )
+        def run_api() -> None:
+            uvicorn.run(app, host=args.api_host, port=api_port, log_level="error")
+
+        api_thread = threading.Thread(target=run_api, daemon=True)
+        api_thread.start()
         _wait_for_api(api_url)
 
-        atexit.register(_stop_processes, api_proc, core_proc)
+        atexit.register(_stop_processes, core_proc)
 
         webview.create_window(WINDOW_TITLE, api_url, width=1480, height=920)
         webview.start(debug=False)
@@ -197,7 +180,7 @@ def run() -> int:
         _show_error_dialog(f"Eroare la inițializare: {exc}")
         return 1
     finally:
-        _stop_processes(api_proc, core_proc)
+        _stop_processes(core_proc)
 
 
 if __name__ == "__main__":
