@@ -11,7 +11,7 @@ This project can be shipped as a standalone desktop app (single-click), without 
 ## What `app_wrapper` handles
 
 - **Process manager**: starts `sdr_core` + FastAPI in the background
-- **Window wrapper**: opens the UI in a native window with `pywebview`
+- **Window wrapper**: opens the UI in a native window with `PySide6 + Qt WebEngine`
 - **Lifecycle controller**: sends `terminate()` to child processes on close
 - **Resource discovery**: resolves runtime paths, including inside PyInstaller bundles
 - **Dynamic port**: automatically chooses a free port when not explicitly set

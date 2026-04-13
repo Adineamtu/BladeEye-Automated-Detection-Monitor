@@ -15,7 +15,7 @@ Industrial-grade, real-time spectral monitoring for BladeRF hardware, with both 
 - ✅ No Python installation required.
 - ✅ No Node.js installation required.
 - ✅ Launches acquisition engine + API + UI automatically.
-- ✅ Opens the interface in a native window (`pywebview`).
+- ✅ Opens the interface in a native window (`PySide6 + Qt WebEngine`).
 
 ## Dev Section (for RF enthusiasts)
 

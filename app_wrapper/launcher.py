@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone launcher that orchestrates SDR core, API backend and a native webview."""
+"""Standalone launcher that orchestrates SDR core, API backend and a Qt WebEngine window."""
 
 from __future__ import annotations
 
@@ -16,15 +16,11 @@ from typing import Iterable
 
 import requests
 import uvicorn
-
-try:
-    import tkinter as tk
-    from tkinter import messagebox
-except Exception:  # pragma: no cover
-    tk = None
-    messagebox = None
-
-import webview
+from PySide6.QtCore import QCoreApplication, QTimer, QUrl
+from PySide6.QtGui import QIcon
+from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox
 from api import app
 
 WINDOW_TITLE = "Reactive Jamming Monitor"
@@ -34,6 +30,62 @@ API_HEALTH_ENDPOINT = "/api/config"
 
 class LauncherError(RuntimeError):
     """Raised when the standalone stack cannot be initialized."""
+
+
+class APIServerThread(threading.Thread):
+    """Runs uvicorn in background and allows graceful shutdown."""
+
+    def __init__(self, host: str, port: int) -> None:
+        super().__init__(daemon=True)
+        self.host = host
+        self.port = port
+        self.server: uvicorn.Server | None = None
+
+    def run(self) -> None:
+        config = uvicorn.Config(app, host=self.host, port=self.port, log_level="critical")
+        self.server = uvicorn.Server(config)
+        self.server.run()
+
+    def stop(self) -> None:
+        if self.server is not None:
+            self.server.should_exit = True
+
+
+class BladeEyeWindow(QMainWindow):
+    """Main application window backed by Qt WebEngine."""
+
+    def __init__(self, app_url: str) -> None:
+        super().__init__()
+        self._app_url = app_url
+        self.setWindowTitle(WINDOW_TITLE)
+        self.resize(1480, 920)
+        self._configure_icon()
+        self.web_view = QWebEngineView(self)
+        self.setCentralWidget(self.web_view)
+        self._configure_webengine()
+        self.web_view.setUrl(QUrl("about:blank"))
+
+    def load_app(self) -> None:
+        self.web_view.setUrl(QUrl(self._app_url))
+
+    def _configure_icon(self) -> None:
+        icon_path = _find_existing_path(
+            [
+                _resource_root() / "assets" / "icon.ico",
+                _resource_root() / "assets" / "icon.png",
+            ]
+        )
+        if icon_path:
+            self.setWindowIcon(QIcon(str(icon_path)))
+
+    def _configure_webengine(self) -> None:
+        settings = self.web_view.settings()
+        settings.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        profile = QWebEngineProfile.defaultProfile()
+        profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
+        profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
 
 
 def _resource_root() -> Path:
@@ -97,13 +149,24 @@ def _silent_creation_flags() -> int:
 
 
 def _show_error_dialog(message: str, title: str = "Reactive Jamming") -> None:
-    if tk is None or messagebox is None:
+    app_instance = QCoreApplication.instance()
+    if app_instance is None:
         print(f"{title}: {message}", file=sys.stderr)
         return
-    root = tk.Tk()
-    root.withdraw()
-    messagebox.showerror(title, message)
-    root.destroy()
+    QMessageBox.critical(None, title, message)
+
+
+def _configure_qt_runtime() -> None:
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    extra_flags = [
+        "--enable-gpu-rasterization",
+        "--enable-zero-copy",
+        "--ignore-gpu-blocklist",
+        "--disable-logging",
+    ]
+    merged = " ".join(token for token in [flags, *extra_flags] if token).strip()
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = merged
+    os.environ.setdefault("QT_LOGGING_RULES", "*.debug=false;qt.webenginecontext.debug=false")
 
 
 def _wait_for_api(base_url: str, timeout_s: float = 20.0) -> None:
@@ -146,7 +209,9 @@ def run() -> int:
     api_url = f"http://{args.api_host}:{api_port}"
 
     core_proc: subprocess.Popen | None = None
+    api_thread: APIServerThread | None = None
     try:
+        _configure_qt_runtime()
         frontend_dist = _resolve_frontend_dist()
         if not args.no_core:
             core_binary = _resolve_binary("sdr_core")
@@ -161,18 +226,17 @@ def run() -> int:
         launcher_env["FRONTEND_DIST"] = str(frontend_dist)
         os.environ.update(launcher_env)
 
-        def run_api() -> None:
-            uvicorn.run(app, host=args.api_host, port=api_port, log_level="error")
-
-        api_thread = threading.Thread(target=run_api, daemon=True)
+        api_thread = APIServerThread(args.api_host, api_port)
         api_thread.start()
         _wait_for_api(api_url)
 
+        qt_app = QApplication(sys.argv)
+        window = BladeEyeWindow(api_url)
+        QTimer.singleShot(0, window.load_app)
+        window.show()
         atexit.register(_stop_processes, core_proc)
-
-        webview.create_window(WINDOW_TITLE, api_url, width=1480, height=920)
-        webview.start(debug=False)
-        return 0
+        exit_code = qt_app.exec()
+        return int(exit_code)
     except LauncherError as exc:
         _show_error_dialog(str(exc))
         return 1
@@ -180,6 +244,9 @@ def run() -> int:
         _show_error_dialog(f"Eroare la inițializare: {exc}")
         return 1
     finally:
+        if api_thread:
+            api_thread.stop()
+            api_thread.join(timeout=4)
         _stop_processes(core_proc)
 
 
