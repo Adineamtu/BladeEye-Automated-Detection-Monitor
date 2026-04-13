@@ -1,6 +1,6 @@
 #include "ring_buffer.h"
 #include "shm_layout.h"
-
+#include <fcntl.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
