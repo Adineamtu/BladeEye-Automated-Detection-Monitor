@@ -13,7 +13,12 @@ ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_DIR = ROOT / "frontend"
 CPP_DIR = ROOT / "cpp" / "sdr_core"
 CPP_BUILD_DIR = CPP_DIR / "build"
+# Setează căile relative față de locația acestui script
+ROOT = Path(__file__).parent.parent.absolute()
+APP_WRAPPER_DIR = ROOT / "app_wrapper"
 SPEC_FILE = APP_WRAPPER_DIR / "reactive_jam.spec"
+
+print(f"DEBUG: Looking for spec file at: {SPEC_FILE}")
 DIST_DIR = ROOT / "dist"
 RELEASE_DIR = ROOT / "release"
 
