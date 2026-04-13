@@ -10,6 +10,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fftw3.h>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <netinet/in.h>
@@ -30,7 +32,6 @@
 namespace {
 
 using Complex = std::complex<float>;
-constexpr const char* kShmName = "/sdr_core_spectrum";
 constexpr const char* kAlertSocket = "/tmp/sdr_core_alert.sock";
 constexpr const char* kCmdSocket = "/tmp/sdr_core_cmd.sock";
 constexpr std::size_t kFftSize = sdr::kSpectrumBins;
@@ -89,15 +90,15 @@ void signal_handler(int) { g_running.store(false); }
 class SharedMemoryWriter {
 public:
     SharedMemoryWriter() {
-        fd_ = shm_open(kShmName, O_CREAT | O_RDWR, 0660);
+        fd_ = shm_open("/bladeeye_buffer", O_CREAT | O_RDWR, 0660);
         if (fd_ < 0) {
             throw std::runtime_error("shm_open failed");
         }
-        if (ftruncate(fd_, sizeof(sdr::SharedSpectrumFrame)) != 0) {
+        if (ftruncate(fd_, sizeof(sdr::SharedSpectrumRingBuffer)) != 0) {
             throw std::runtime_error("ftruncate shared memory failed");
         }
         void* ptr = mmap(nullptr,
-                         sizeof(sdr::SharedSpectrumFrame),
+                         sizeof(sdr::SharedSpectrumRingBuffer),
                          PROT_READ | PROT_WRITE,
                          MAP_SHARED,
                          fd_,
@@ -105,13 +106,15 @@ public:
         if (ptr == MAP_FAILED) {
             throw std::runtime_error("mmap failed");
         }
-        frame_ = reinterpret_cast<sdr::SharedSpectrumFrame*>(ptr);
-        std::memset(frame_, 0, sizeof(sdr::SharedSpectrumFrame));
+        ring_ = reinterpret_cast<sdr::SharedSpectrumRingBuffer*>(ptr);
+        std::memset(ring_, 0, sizeof(sdr::SharedSpectrumRingBuffer));
+        ring_->control.version = 1;
+        ring_->control.slot_count = static_cast<uint32_t>(sdr::kSharedRingSlots);
     }
 
     ~SharedMemoryWriter() {
-        if (frame_) {
-            munmap(frame_, sizeof(sdr::SharedSpectrumFrame));
+        if (ring_) {
+            munmap(ring_, sizeof(sdr::SharedSpectrumRingBuffer));
         }
         if (fd_ >= 0) {
             close(fd_);
@@ -129,25 +132,30 @@ public:
                  float cpu_usage,
                  const std::array<float, sdr::kSpectrumBins>& bins,
                  const std::vector<sdr::PeakEvent>& peaks) {
-        frame_->header.frame_id = frame_id;
-        frame_->header.sample_rate = sample_rate;
-        frame_->header.analog_bandwidth = analog_bandwidth;
-        frame_->header.center_freq = center_freq;
-        frame_->header.last_heartbeat = last_heartbeat;
-        frame_->header.dropped_samples = dropped_samples;
-        frame_->header.buffer_fill_percent = buffer_fill_percent;
-        frame_->header.processing_latency_ms = processing_latency_ms;
-        frame_->header.cpu_usage = cpu_usage;
-        frame_->spectrum_data = bins;
-        const auto count = std::min(peaks.size(), frame_->peaks.size());
-        frame_->header.peak_count = static_cast<uint32_t>(count);
-        std::copy_n(peaks.begin(), count, frame_->peaks.begin());
-        frame_->header.state.store(1, std::memory_order_release);
+        auto write_seq = std::atomic_ref<uint64_t>(ring_->control.write_seq);
+        const uint64_t seq = write_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+        auto& slot = ring_->slots[seq % sdr::kSharedRingSlots];
+        std::atomic_ref<uint32_t>(slot.header.state).store(1, std::memory_order_release);
+        slot.header.frame_id = frame_id;
+        slot.header.sample_rate = sample_rate;
+        slot.header.analog_bandwidth = analog_bandwidth;
+        slot.header.center_freq = center_freq;
+        slot.header.last_heartbeat = last_heartbeat;
+        slot.header.dropped_samples = dropped_samples;
+        slot.header.buffer_fill_percent = buffer_fill_percent;
+        slot.header.processing_latency_ms = processing_latency_ms;
+        slot.header.cpu_usage = cpu_usage;
+        slot.spectrum_data = bins;
+        const auto count = std::min(peaks.size(), slot.peaks.size());
+        slot.header.peak_count = static_cast<uint32_t>(count);
+        std::copy_n(peaks.begin(), count, slot.peaks.begin());
+        std::atomic_ref<uint32_t>(slot.header.state).store(2, std::memory_order_release);
+        std::atomic_ref<uint64_t>(ring_->control.last_committed_seq).store(seq, std::memory_order_release);
     }
 
 private:
     int fd_{-1};
-    sdr::SharedSpectrumFrame* frame_{nullptr};
+    sdr::SharedSpectrumRingBuffer* ring_{nullptr};
 };
 
 class UnixDatagramSocket {
@@ -361,6 +369,9 @@ void processing_thread(sdr::SpscRingBuffer<SampleChunk, kRingCapacity>& ring, Ru
 }  // namespace
 
 int main() {
+    std::filesystem::create_directories("logs");
+    static std::ofstream engine_log("logs/engine_error.log", std::ios::app);
+    std::cerr.rdbuf(engine_log.rdbuf());
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
