@@ -6,7 +6,7 @@ Acest folder conține stratul de orchestrare pentru rularea proiectului ca aplic
 
 - pornește `sdr_core` (C++) în background, fără consolă vizibilă;
 - pornește API-ul FastAPI pe un port dinamic liber;
-- deschide UI-ul React într-o fereastră nativă (`pywebview`), fără browser extern;
+- deschide UI-ul React într-o fereastră nativă (`PySide6 + Qt WebEngine`), fără browser extern;
 - oprește automat procesele copil la închiderea ferestrei;
 - afișează mesaje de eroare native dacă lipsesc binarele sau frontend-ul build-uit.
 

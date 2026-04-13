@@ -10,4 +10,4 @@ jinja2
 weasyprint
 requests
 
-pywebview
+PySide6

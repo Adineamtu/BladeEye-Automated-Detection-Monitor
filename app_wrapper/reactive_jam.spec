@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 block_cipher = None
 
@@ -9,13 +10,13 @@ work_dir = os.getcwd()
 a = Analysis(
     ['launcher.py'],
     pathex=[work_dir],
-    binaries=[
-        ('../cpp/sdr_core/build/sdr_core', '.'),
-    ],
     datas=[
         ('../frontend/dist', 'frontend/dist'),
-    ],
-    hiddenimports=['webview', 'bottle'],
+    ] + collect_data_files('PySide6'),
+    hiddenimports=collect_submodules('PySide6'),
+    binaries=[
+        ('../cpp/sdr_core/build/sdr_core', '.'),
+    ] + collect_dynamic_libs('PySide6'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
