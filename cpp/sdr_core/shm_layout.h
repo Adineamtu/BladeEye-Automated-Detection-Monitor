@@ -7,19 +7,20 @@
 namespace sdr {
 
 constexpr std::size_t kSpectrumBins = 2048;
+constexpr std::size_t kSharedRingBytes = 128U * 1024U * 1024U;
 
 struct SharedSpectrumHeader {
-    std::atomic<uint32_t> state; // 0 = taken, 1 = ready
     uint64_t frame_id;
+    uint64_t center_freq;
+    uint64_t last_heartbeat;
     uint32_t sample_rate;
     uint32_t analog_bandwidth;
-    uint64_t center_freq;
     uint32_t peak_count;
-    uint64_t last_heartbeat;
     uint32_t dropped_samples;
     float buffer_fill_percent;
     float processing_latency_ms;
     float cpu_usage;
+    uint32_t state; // 0 = free, 1 = writing, 2 = ready
 };
 
 struct PeakEvent {
@@ -34,5 +35,24 @@ struct SharedSpectrumFrame {
     std::array<float, kSpectrumBins> spectrum_data;
     std::array<PeakEvent, kMaxPeaks> peaks;
 };
+
+constexpr std::size_t kSharedSlotBytes = sizeof(SharedSpectrumFrame);
+constexpr std::size_t kSharedRingSlots =
+    (kSharedRingBytes / kSharedSlotBytes) > 0 ? (kSharedRingBytes / kSharedSlotBytes) : 1;
+
+struct SharedRingControl {
+    uint32_t version;
+    uint32_t slot_count;
+    uint64_t write_seq;
+    uint64_t last_committed_seq;
+};
+
+struct SharedSpectrumRingBuffer {
+    SharedRingControl control;
+    std::array<SharedSpectrumFrame, kSharedRingSlots> slots;
+};
+
+static_assert(sizeof(SharedRingControl) == 24, "SharedRingControl layout changed unexpectedly");
+static_assert(sizeof(SharedSpectrumHeader) == 56, "SharedSpectrumHeader layout changed unexpectedly");
 
 }  // namespace sdr

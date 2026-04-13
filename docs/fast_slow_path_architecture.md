@@ -60,14 +60,30 @@ Acest pas pregătește migrarea incrementală către engine-ul C++ fără a rupe
 **Ce livrăm:**
 - zonă de memorie partajată între C++ (writer) și Python (reader);
 - protocol de snapshot cu header fix (versiune, timestamp, bins, scale, seq).
+- canalul de date în `/dev/shm` (ex: `/dev/shm/bladeeye_buffer`) ca "autostradă" comună pentru procese.
+- sincronizare strictă writer/reader cu semafoare (sau mecanism echivalent de semnalizare) pentru a evita citiri concurente.
+- buffer circular cu dimensiune fixă (ex. 128 MB) pentru consum de RAM predictibil.
 
 **De ce:**
 - eliminăm copii intermediare de date;
 - Python rămâne orchestration/control plane, nu data plane.
+- înlocuim transportul WebSocket pentru payload-ul mare cu acces direct în RAM, reducând latența de capăt.
 
 **Criterii de acceptanță:**
 - un singur write al datelor de spectru pe frame;
 - citire non-blocantă din FastAPI și fallback curat la ultimul frame valid.
+- fără `segfault`/corupție la stres concurent (writer și reader la 100% CPU);
+- fără creștere nelimitată de memorie în regim continuu 24/7.
+
+#### Contract de sincronizare recomandat (fără cod)
+
+1. Writer-ul rezervă slotul următor din ring.
+2. Writer-ul marchează slotul ca "în scriere" (semafor/stare intermediară).
+3. Writer-ul scrie payload + metadata (timestamp, seq, lungime, versiune).
+4. Writer-ul face commit atomic al stării slotului ("valid pentru citire").
+5. Reader-ul consumă numai sloturi marcate "valid", niciodată sloturi în scriere.
+
+Acest contract previne condițiile de cursă și citirile de adrese invalide, principalul risc real în zero-copy.
 
 ### 3) Acoperișul — Detectoare DSP în C++
 
@@ -111,6 +127,30 @@ Acest pas pregătește migrarea incrementală către engine-ul C++ fără a rupe
 - detectare timeout și recovery automat fără intervenție manuală;
 - jurnal clar al cauzei și al acțiunilor de remediere.
 
+### 6) Igienă operațională obligatorie — Cleanup + logging
+
+**Cleanup pentru "orfani" din shared memory:**
+- launcher-ul execută la fiecare pornire o fază de "preflight cleanup";
+- dacă găsește segmentul vechi (`/dev/shm/bladeeye_buffer`), validează dacă există procese active;
+- în absența unui owner valid, șterge segmentul și recreează structurile curate.
+
+**De ce:**
+- previne blocaje după crash-uri;
+- elimină stări "zombie" care pot da erori false la pornire.
+
+**Log-to-file (diagnostic minim obligatoriu):**
+- două fișiere separate în directorul aplicației:
+  - `logs/engine_error.log` (motor C++ / SDR);
+  - `logs/api_error.log` (API / orchestrare / WebSocket control plane).
+- rotație simplă pe dimensiune/timp pentru a evita umplerea discului.
+- fiecare eroare majoră include timestamp, componentă, cod de eroare, context (ex. port ocupat, access denied, timeout USB).
+
+**Criterii de acceptanță:**
+- orice incident critic are trasabilitate în fișier în < 1s de la apariție;
+- startup-ul raportează explicit acțiunile de cleanup efectuate.
+
 ## Observație de implementare
 
 Strategia optimă este migrarea incrementală în pași mici, fiecare cu metrici de performanță și regresie: mai întâi mutăm **acquisition + shared memory**, apoi **DSP detections**, iar la final optimizăm **rendering-ul frontend**.
+
+În modelul final, WebSocket rămâne strict **control plane** (Start/Stop/Set Frequency/health), iar planul de date de volum mare rămâne în shared memory.

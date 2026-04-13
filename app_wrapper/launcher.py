@@ -26,6 +26,7 @@ from api import app
 WINDOW_TITLE = "Reactive Jamming Monitor"
 DEFAULT_HOST = "127.0.0.1"
 API_HEALTH_ENDPOINT = "/api/config"
+SHM_BUFFER_PATH = Path("/dev/shm/bladeeye_buffer")
 
 
 class LauncherError(RuntimeError):
@@ -198,6 +199,19 @@ def _stop_processes(*procs: subprocess.Popen | None) -> None:
         _terminate_process(proc)
 
 
+def _cleanup_orphan_ipc() -> None:
+    """Remove stale shared-memory/socket artifacts from previous crashed runs."""
+    for stale_socket in (Path("/tmp/sdr_core_cmd.sock"), Path("/tmp/sdr_core_alert.sock")):
+        try:
+            stale_socket.unlink(missing_ok=True)
+        except Exception:
+            pass
+    try:
+        SHM_BUFFER_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def run() -> int:
     parser = argparse.ArgumentParser(description="Standalone launcher for Reactive Jamming")
     parser.add_argument("--port", type=int, default=0, help="Port API; 0 = auto")
@@ -210,15 +224,20 @@ def run() -> int:
 
     core_proc: subprocess.Popen | None = None
     api_thread: APIServerThread | None = None
+    engine_log = None
     try:
         _configure_qt_runtime()
+        _cleanup_orphan_ipc()
         frontend_dist = _resolve_frontend_dist()
+        logs_dir = _resource_root() / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        engine_log = open(logs_dir / "engine_error.log", "a", encoding="utf-8")
         if not args.no_core:
             core_binary = _resolve_binary("sdr_core")
             core_proc = subprocess.Popen(
                 [str(core_binary)],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=engine_log,
                 creationflags=_silent_creation_flags(),
             )
 
@@ -248,6 +267,8 @@ def run() -> int:
             api_thread.stop()
             api_thread.join(timeout=4)
         _stop_processes(core_proc)
+        if engine_log is not None:
+            engine_log.close()
 
 
 if __name__ == "__main__":

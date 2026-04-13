@@ -9,7 +9,6 @@ from collections import deque
 from pathlib import Path
 from pydantic import BaseModel
 from dataclasses import asdict
-import ctypes
 import mmap
 import os
 import subprocess
@@ -19,11 +18,13 @@ import time
 import json
 import socket
 import sys
+import struct
 import numpy as np
 import io
 import base64
 import datetime
 import logging
+from logging.handlers import RotatingFileHandler
 import matplotlib.pyplot as plt
 from weasyprint import HTML
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -84,6 +85,27 @@ recordings: List[dict] = []
 recent_signals: deque[Signal] = deque(maxlen=50)
 alert_subscribers: set[asyncio.Queue] = set()
 log = logging.getLogger(__name__)
+
+
+def _configure_file_logging() -> None:
+    """Write API/runtime errors to disk for post-mortem diagnosis."""
+    logs_dir = Path("logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        logs_dir / "api_error.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setLevel(logging.ERROR)
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    if root.level > logging.INFO:
+        root.setLevel(logging.INFO)
+
+
+_configure_file_logging()
 
 # Directory on disk used for persisting session JSON files.
 SESSIONS_DIR = Path("sessions")
@@ -218,50 +240,86 @@ ALLOWED_SAMPLE_RATES = {
 }
 
 SDR_CORE_CMD_SOCKET = "/tmp/sdr_core_cmd.sock"
-SHM_PATH = "/dev/shm/sdr_core_spectrum"
+SHM_PATH = "/dev/shm/bladeeye_buffer"
 WATCHDOG_CHECK_INTERVAL = 0.5
 WATCHDOG_STALE_SECONDS = 1.0
+SHM_RING_VERSION = 1
 
 
-class _SharedSpectrumHeader(ctypes.Structure):
-    _fields_ = [
-        ("state", ctypes.c_uint32),
-        ("frame_id", ctypes.c_uint64),
-        ("sample_rate", ctypes.c_uint32),
-        ("analog_bandwidth", ctypes.c_uint32),
-        ("center_freq", ctypes.c_uint64),
-        ("peak_count", ctypes.c_uint32),
-        ("last_heartbeat", ctypes.c_uint64),
-        ("dropped_samples", ctypes.c_uint32),
-        ("buffer_fill_percent", ctypes.c_float),
-        ("processing_latency_ms", ctypes.c_float),
-        ("cpu_usage", ctypes.c_float),
-    ]
+RING_CONTROL_FORMAT = "<IIQQ"
+SPECTRUM_HEADER_FORMAT = "<QQQIIIIfffI"
+RING_CONTROL_SIZE = struct.calcsize(RING_CONTROL_FORMAT)
+SPECTRUM_HEADER_SIZE = struct.calcsize(SPECTRUM_HEADER_FORMAT)
+SPECTRUM_BINS = 2048
+MAX_PEAKS = 64
+FRAME_SIZE = SPECTRUM_HEADER_SIZE + (SPECTRUM_BINS * 4) + (MAX_PEAKS * 2 * 4)
+
+
+def _read_latest_sdr_core_frame() -> tuple[dict, np.ndarray]:
+    """Read latest committed shared-memory slot from the SDR core ring."""
+    if not os.path.exists(SHM_PATH):
+        raise FileNotFoundError("Shared memory segment not initialized")
+
+    with open(SHM_PATH, "rb") as fh:
+        with mmap.mmap(fh.fileno(), length=0, access=mmap.ACCESS_READ) as mm:
+            if mm.size() < RING_CONTROL_SIZE + FRAME_SIZE:
+                raise RuntimeError("Shared memory segment too small")
+            for _ in range(3):
+                version, slot_count, _, committed = struct.unpack_from(RING_CONTROL_FORMAT, mm, 0)
+                if version != SHM_RING_VERSION:
+                    raise RuntimeError(f"Unsupported shared memory version: {version}")
+                if slot_count <= 0:
+                    raise RuntimeError("Invalid slot_count in shared memory")
+                index = committed % slot_count
+                offset = RING_CONTROL_SIZE + index * FRAME_SIZE
+                if offset + FRAME_SIZE > mm.size():
+                    raise RuntimeError("Shared memory slot offset outside mapped region")
+                header_values = struct.unpack_from(SPECTRUM_HEADER_FORMAT, mm, offset)
+                (
+                    frame_id,
+                    center_freq,
+                    last_heartbeat,
+                    sample_rate,
+                    analog_bandwidth,
+                    peak_count,
+                    dropped_samples,
+                    buffer_fill_percent,
+                    processing_latency_ms,
+                    cpu_usage,
+                    state,
+                ) = header_values
+                if state != 2:
+                    raise RuntimeError("Latest shared-memory slot is not ready")
+                spectrum_offset = offset + SPECTRUM_HEADER_SIZE
+                spectrum = np.frombuffer(mm, dtype="<f4", count=SPECTRUM_BINS, offset=spectrum_offset).copy()
+                _, _, _, committed_after = struct.unpack_from(RING_CONTROL_FORMAT, mm, 0)
+                if committed_after == committed:
+                    break
+            else:
+                raise RuntimeError("Shared-memory commit moved while reading frame")
+
+    return (
+        {
+            "state": int(state),
+            "frame_id": int(frame_id),
+            "sample_rate": int(sample_rate),
+            "analog_bandwidth": int(analog_bandwidth),
+            "center_freq": int(center_freq),
+            "peak_count": int(peak_count),
+            "last_heartbeat": int(last_heartbeat),
+            "dropped_samples": int(dropped_samples),
+            "buffer_fill_percent": float(buffer_fill_percent),
+            "processing_latency_ms": float(processing_latency_ms),
+            "cpu_usage": float(cpu_usage),
+        },
+        spectrum,
+    )
 
 
 def _read_sdr_core_header() -> dict:
     """Read health/header fields exported by the C++ SDR core shared memory."""
-    if not os.path.exists(SHM_PATH):
-        raise FileNotFoundError("Shared memory segment not initialized")
-
-    size = ctypes.sizeof(_SharedSpectrumHeader)
-    with open(SHM_PATH, "rb") as fh:
-        with mmap.mmap(fh.fileno(), length=size, access=mmap.ACCESS_READ) as mm:
-            header = _SharedSpectrumHeader.from_buffer_copy(mm[:size])
-
-    return {
-        "state": int(header.state),
-        "frame_id": int(header.frame_id),
-        "sample_rate": int(header.sample_rate),
-        "analog_bandwidth": int(header.analog_bandwidth),
-        "center_freq": int(header.center_freq),
-        "peak_count": int(header.peak_count),
-        "last_heartbeat": int(header.last_heartbeat),
-        "dropped_samples": int(header.dropped_samples),
-        "buffer_fill_percent": float(header.buffer_fill_percent),
-        "processing_latency_ms": float(header.processing_latency_ms),
-        "cpu_usage": float(header.cpu_usage),
-    }
+    header, _ = _read_latest_sdr_core_frame()
+    return header
 
 
 def _recover_sdr_core() -> None:
@@ -989,21 +1047,29 @@ async def spectrum_stream(websocket: WebSocket) -> None:
     frame_delay = 0.04
     try:
         while True:
-            if monitor is not None and hasattr(monitor, "get_power_spectrum"):
-                spectrum = np.asarray(monitor.get_power_spectrum(), dtype=float)
-                expected_size = int(getattr(monitor, "fft_size", spectrum.size))
-                if (
-                    spectrum.size == 0
-                    or expected_size <= 0
-                    or spectrum.size != expected_size
-                    or not np.isfinite(spectrum).all()
-                ):
+            try:
+                _, spectrum = _read_latest_sdr_core_frame()
+                spectrum = np.asarray(spectrum, dtype=float)
+                if spectrum.size == 0 or not np.isfinite(spectrum).all():
                     await asyncio.sleep(frame_delay)
                     continue
                 fft_size = spectrum.size
-            else:
-                spectrum = np.random.random(fft_size)
-            await websocket.send_json(spectrum.tolist())
+            except Exception:
+                if monitor is not None and hasattr(monitor, "get_power_spectrum"):
+                    spectrum = np.asarray(monitor.get_power_spectrum(), dtype=float)
+                    expected_size = int(getattr(monitor, "fft_size", spectrum.size))
+                    if (
+                        spectrum.size == 0
+                        or expected_size <= 0
+                        or spectrum.size != expected_size
+                        or not np.isfinite(spectrum).all()
+                    ):
+                        await asyncio.sleep(frame_delay)
+                        continue
+                    fft_size = spectrum.size
+                else:
+                    spectrum = np.random.random(fft_size)
+            await websocket.send_json(np.asarray(spectrum, dtype=float).tolist())
             await asyncio.sleep(frame_delay)
     except WebSocketDisconnect:
         # Client disconnected; simply exit the loop
@@ -1020,20 +1086,28 @@ async def spectrum_stream_binary(websocket: WebSocket) -> None:
     frame_delay = 0.04
     try:
         while True:
-            if monitor is not None and hasattr(monitor, "get_power_spectrum"):
-                spectrum = np.asarray(monitor.get_power_spectrum(), dtype=np.float32)
-                expected_size = int(getattr(monitor, "fft_size", spectrum.size))
-                if (
-                    spectrum.size == 0
-                    or expected_size <= 0
-                    or spectrum.size != expected_size
-                    or not np.isfinite(spectrum).all()
-                ):
+            try:
+                _, spectrum = _read_latest_sdr_core_frame()
+                spectrum = np.asarray(spectrum, dtype=np.float32)
+                if spectrum.size == 0 or not np.isfinite(spectrum).all():
                     await asyncio.sleep(frame_delay)
                     continue
                 fft_size = spectrum.size
-            else:
-                spectrum = np.random.random(fft_size).astype(np.float32)
+            except Exception:
+                if monitor is not None and hasattr(monitor, "get_power_spectrum"):
+                    spectrum = np.asarray(monitor.get_power_spectrum(), dtype=np.float32)
+                    expected_size = int(getattr(monitor, "fft_size", spectrum.size))
+                    if (
+                        spectrum.size == 0
+                        or expected_size <= 0
+                        or spectrum.size != expected_size
+                        or not np.isfinite(spectrum).all()
+                    ):
+                        await asyncio.sleep(frame_delay)
+                        continue
+                    fft_size = spectrum.size
+                else:
+                    spectrum = np.random.random(fft_size).astype(np.float32)
 
             await websocket.send_bytes(spectrum.tobytes())
             await asyncio.sleep(frame_delay)
