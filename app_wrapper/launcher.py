@@ -164,6 +164,7 @@ def run() -> int:
         launcher_env = os.environ.copy()
         launcher_env["FRONTEND_DIST"] = str(frontend_dist)
 
+        root = _resource_root()
         api_cmd = [
             sys.executable,
             "-m",
@@ -174,7 +175,14 @@ def run() -> int:
             "--port",
             str(api_port),
         ]
-        api_proc = _start_process(api_cmd, env=launcher_env)
+        api_proc = subprocess.Popen(
+            api_cmd,
+            env=launcher_env,
+            cwd=str(root),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_silent_creation_flags(),
+        )
         _wait_for_api(api_url)
 
         atexit.register(_stop_processes, api_proc, core_proc)
