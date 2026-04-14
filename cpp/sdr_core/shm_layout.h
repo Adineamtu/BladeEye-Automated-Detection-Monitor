@@ -9,6 +9,8 @@ namespace sdr {
 constexpr std::size_t kSpectrumBins = 2048;
 constexpr std::size_t kSharedRingBytes = 128U * 1024U * 1024U;
 
+#pragma pack(push, 1)
+
 struct SharedSpectrumHeader {
     uint64_t frame_id;
     uint64_t center_freq;
@@ -51,6 +53,8 @@ struct SharedSpectrumRingBuffer {
     SharedRingControl control;
     std::array<SharedSpectrumFrame, kSharedRingSlots> slots;
 };
+
+#pragma pack(pop)
 
 static_assert(sizeof(SharedRingControl) == 24, "SharedRingControl layout changed unexpectedly");
 static_assert(sizeof(SharedSpectrumHeader) == 56, "SharedSpectrumHeader layout changed unexpectedly");

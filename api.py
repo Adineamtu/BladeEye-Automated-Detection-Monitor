@@ -247,6 +247,8 @@ SHM_PATH = "/dev/shm/bladeeye_buffer"
 WATCHDOG_CHECK_INTERVAL = 0.5
 WATCHDOG_STALE_SECONDS = 1.0
 SHM_RING_VERSION = 1
+SHM_STARTUP_PROBE_TIMEOUT_SECONDS = 3.0
+SHM_STARTUP_POLL_INTERVAL_SECONDS = 0.1
 
 
 RING_CONTROL_FORMAT = "<IIQQ"
@@ -287,6 +289,13 @@ def _read_latest_sdr_core_frame() -> tuple[dict, np.ndarray]:
                     raise RuntimeError(f"Unsupported shared memory version: {version}")
                 if slot_count <= 0:
                     raise RuntimeError("Invalid slot_count in shared memory")
+                expected_ring_size = RING_CONTROL_SIZE + (slot_count * FRAME_SIZE)
+                if mm.size() != expected_ring_size:
+                    raise RuntimeError(
+                        "Shared memory size mismatch: "
+                        f"actual={mm.size()} expected={expected_ring_size} "
+                        f"(slot_count={slot_count}, frame_size={FRAME_SIZE})"
+                    )
                 index = committed % slot_count
                 offset = RING_CONTROL_SIZE + index * FRAME_SIZE
                 if offset + FRAME_SIZE > mm.size():
@@ -351,7 +360,20 @@ def _safe_startup_probe() -> None:
                 f"SharedSpectrumHeader mismatch: python={SPECTRUM_HEADER_SIZE} expected={EXPECTED_SPECTRUM_HEADER_SIZE}"
             )
         if os.path.exists(SHM_PATH):
-            _read_latest_sdr_core_frame()
+            deadline = time.monotonic() + SHM_STARTUP_PROBE_TIMEOUT_SECONDS
+            while True:
+                try:
+                    _read_latest_sdr_core_frame()
+                    break
+                except RuntimeError as exc:
+                    if "Latest shared-memory slot is not ready" not in str(exc):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            "Latest shared-memory slot remained not ready "
+                            f"for {SHM_STARTUP_PROBE_TIMEOUT_SECONDS:.1f}s"
+                        ) from exc
+                    time.sleep(SHM_STARTUP_POLL_INTERVAL_SECONDS)
     except Exception as exc:
         _write_plain_startup_debug(f"SHM probe failed: {exc!r}")
         log.exception("SHM startup probe failed")
