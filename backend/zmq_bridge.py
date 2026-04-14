@@ -14,8 +14,9 @@ except Exception:  # pragma: no cover
 class ZmqSpectrumConsumer:
     """Receive float32 spectrum frames from a ZeroMQ PULL endpoint."""
 
-    def __init__(self, endpoint: str) -> None:
+    def __init__(self, endpoint: str, max_pending_frames: int = 100) -> None:
         self.endpoint = endpoint
+        self.max_pending_frames = max(1, int(max_pending_frames))
         self._ctx = None
         self._sock = None
         self.enabled = False
@@ -34,6 +35,7 @@ class ZmqSpectrumConsumer:
             return
         self._ctx = zmq.Context.instance()
         self._sock = self._ctx.socket(zmq.PULL)
+        self._sock.setsockopt(zmq.RCVHWM, self.max_pending_frames)
         self._sock.connect(endpoint)
         self.enabled = True
 
@@ -45,7 +47,7 @@ class ZmqSpectrumConsumer:
         loop_started = time.time()
         latest = None
         dropped = 0
-        while True:
+        while dropped < self.max_pending_frames:
             try:
                 payload = self._sock.recv(flags=zmq.NOBLOCK)
                 if latest is not None:
@@ -53,6 +55,9 @@ class ZmqSpectrumConsumer:
                 latest = payload
             except zmq.Again:
                 break
+        else:
+            # Queue pressure is high; prefer fresh data over adding latency.
+            self.dropped_frames += 1
 
         if latest is None:
             return None

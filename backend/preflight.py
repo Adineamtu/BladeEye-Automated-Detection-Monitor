@@ -99,6 +99,7 @@ def run_preflight() -> PreflightStatus:
     hw = detect_bladerf()
     usb_ok = check_usb_permissions() if hw else False
     firmware_version = detect_firmware_version() if hw else None
+    comms_failed = bool(hw and firmware_version is None)
     firmware_warning = None
     parsed_fw = _parse_version(firmware_version or "")
     if hw and parsed_fw is not None and parsed_fw < MIN_BLADE_RF_FIRMWARE:
@@ -117,11 +118,17 @@ def run_preflight() -> PreflightStatus:
             firmware_warning=firmware_warning,
         )
     if hw and not usb_ok:
+        detail = "BladeRF detectat, dar permisiuni USB insuficiente. Comutare automată pe demo."
+        if comms_failed:
+            detail += (
+                " Comunicarea cu dispozitivul a eșuat; recomandat reset software al USB bus-ului "
+                "și verificarea alimentării/portului USB (bladeRF poate necesita curent ridicat)."
+            )
         return PreflightStatus(
             hardware_detected=True,
             usb_access_ok=False,
             mode="demo",
-            detail="BladeRF detectat, dar permisiuni USB insuficiente. Comutare automată pe demo.",
+            detail=detail,
             firmware_version=firmware_version,
             firmware_warning=firmware_warning,
         )
