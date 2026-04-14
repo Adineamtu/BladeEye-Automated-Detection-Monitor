@@ -72,6 +72,7 @@ except Exception:  # pragma: no cover
         protocol_name: str | None = None
         likely_purpose: str | None = None
         label: str | None = None
+        sync_word: str | None = None
 
 app = FastAPI()
 app.add_middleware(
@@ -275,6 +276,7 @@ class SignalPayload(BaseModel):
     protocol_name: str | None = None
     likely_purpose: str | None = None
     label: str | None = None
+    sync_word: str | None = None
 
 
 class RecordingItem(BaseModel):
@@ -702,6 +704,7 @@ def _capture_sigint_event(sig: Signal) -> None:
         protocol_name=getattr(sig, "protocol_name", None),
         decoded_payload=str(payload) if payload else None,
         confidence=confidence,
+        sync_word=getattr(sig, "sync_word", None),
     )
     try:
         loop = asyncio.get_running_loop()

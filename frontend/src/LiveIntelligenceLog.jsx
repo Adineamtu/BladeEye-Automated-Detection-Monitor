@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 
 function downloadBlob(contentType, filename, content) {
   const blob = new Blob([content], { type: contentType });
@@ -19,6 +19,7 @@ export default function LiveIntelligenceLog() {
   const [targets, setTargets] = useState([]);
   const [form, setForm] = useState({ label: '', center_frequency: '433900000', tolerance_hz: '25000', modulation_type: 'FSK' });
   const [hitAlert, setHitAlert] = useState('');
+  const [expandedRows, setExpandedRows] = useState({});
 
   async function loadTargets() {
     const res = await fetch('/api/sigint/targets');
@@ -84,6 +85,19 @@ export default function LiveIntelligenceLog() {
   }
 
   const rows = useMemo(() => items.slice(0, 150), [items]);
+  function parseFrequencies(raw) {
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function toggleExpanded(id) {
+    setExpandedRows((prev) => ({ ...prev, [id]: !prev[id] }));
+  }
 
   return (
     <section className="runtime-logs-panel">
@@ -109,24 +123,57 @@ export default function LiveIntelligenceLog() {
             <th>Time (UTC)</th>
             <th>Frequency</th>
             <th>Protocol</th>
+            <th>Session</th>
             <th>Message</th>
             <th>RSSI</th>
             <th>Hits</th>
             <th>Watch</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((item) => (
-            <tr key={item.id}>
-              <td>{new Date(item.last_seen_ts * 1000).toISOString()}</td>
-              <td>{(item.center_frequency / 1e6).toFixed(4)} MHz</td>
-              <td>{item.protocol_name || item.modulation_type || '-'}</td>
-              <td>{item.decoded_payload || '-'}</td>
-              <td>{Number(item.rssi_db || 0).toFixed(2)} dB</td>
-              <td>{item.hit_count}</td>
-              <td>{item.watchlist_hit ? '✅' : '—'}</td>
-            </tr>
-          ))}
+          {rows.map((item) => {
+            const hopList = parseFrequencies(item.hop_frequencies_json);
+            const isHopping = Number(item.hop_count || 0) > 0 || hopList.length > 1;
+            const rowExpanded = !!expandedRows[item.id];
+            const hopRange = Number(item.hop_max_frequency || item.center_frequency) - Number(item.hop_min_frequency || item.center_frequency);
+            const dwell = item.dwell_time_ms ? `${Number(item.dwell_time_ms).toFixed(1)} ms` : '—';
+            return (
+              <Fragment key={item.id}>
+                <tr key={`main-${item.id}`}>
+                  <td>{new Date(item.last_seen_ts * 1000).toISOString()}</td>
+                  <td>{(item.center_frequency / 1e6).toFixed(4)} MHz</td>
+                  <td>
+                    {item.protocol_name || item.modulation_type || '-'}
+                    {isHopping && <span style={{ marginLeft: '0.4rem', fontSize: '0.74rem', color: '#76b6ff' }}>[FHSS]</span>}
+                  </td>
+                  <td style={{ fontSize: '0.74rem' }}>{item.session_uid || '-'}</td>
+                  <td>{item.decoded_payload || '-'}</td>
+                  <td>{Number(item.rssi_db || 0).toFixed(2)} dB</td>
+                  <td>{item.hit_count}</td>
+                  <td>{item.watchlist_hit ? '✅' : '—'}</td>
+                  <td>
+                    {isHopping ? (
+                      <button type="button" onClick={() => toggleExpanded(item.id)}>
+                        {rowExpanded ? 'Hide Hops' : 'Show Hops'}
+                      </button>
+                    ) : '—'}
+                  </td>
+                </tr>
+                {isHopping && rowExpanded && (
+                  <tr key={`hop-${item.id}`}>
+                    <td colSpan={9} style={{ background: 'rgba(45, 77, 128, 0.24)', padding: '0.6rem 0.8rem' }}>
+                      <div>Base: {(Number(item.base_frequency || item.center_frequency) / 1e6).toFixed(4)} MHz</div>
+                      <div>Hop range: Δ {(hopRange / 1e6).toFixed(4)} MHz · Hop count: {Number(item.hop_count || 0)} · Dwell: {dwell}</div>
+                      <div style={{ marginTop: '0.35rem' }}>
+                        Frequencies: {hopList.map((freq) => `${(Number(freq) / 1e6).toFixed(4)} MHz`).join(' → ') || '—'}
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            );
+          })}
         </tbody>
       </table>
 

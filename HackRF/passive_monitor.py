@@ -105,6 +105,7 @@ class Signal:
     protocol_name: str | None = None
     likely_purpose: str | None = None
     label: str | None = None
+    sync_word: str | None = None
 
 
 def export_signals(signals: list[Signal], path: str) -> None:
