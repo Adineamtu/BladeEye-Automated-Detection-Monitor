@@ -7,6 +7,7 @@ import SignalDetailPanel from './SignalDetailPanel';
 import ControlPanel from './ControlPanel';
 import PatternsPanel from './PatternsPanel';
 import ProtocolManager from './ProtocolManager';
+import LiveIntelligenceLog from './LiveIntelligenceLog';
 import './App.css';
 
 function App() {
@@ -291,6 +292,9 @@ function App() {
         <button type="button" onClick={() => setActiveTab('protocols')}>
           Protocols
         </button>
+        <button type="button" onClick={() => setActiveTab('intel-log')}>
+          Live Intelligence Log
+        </button>
         <button
           type="button"
           className="coming-soon"
@@ -321,6 +325,8 @@ function App() {
         <PatternsPanel />
       ) : activeTab === 'protocols' ? (
         <ProtocolManager />
+      ) : activeTab === 'intel-log' ? (
+        <LiveIntelligenceLog />
       ) : (
         <>
           <SessionManager onLoad={handleLoad} currentSignals={signals} watchlist={watchlist} />

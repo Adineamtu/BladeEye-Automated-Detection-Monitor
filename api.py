@@ -50,6 +50,7 @@ from backend.execution_board import (
 from backend.preflight import PreflightStatus, run_preflight
 from backend.zmq_bridge import ZmqSpectrumConsumer
 from backend.intelligence_engine import IntelligenceEngine
+from backend.sigint_log import SigintLogStore, SigintEvent
 
 # ``Signal`` is defined in ``HackRF.passive_monitor`` which pulls in heavy
 # dependencies like GNU Radio.  Import it lazily and provide a lightweight
@@ -152,6 +153,7 @@ preflight_status: PreflightStatus | None = None
 zmq_consumer: ZmqSpectrumConsumer | None = None
 intelligence_engine = IntelligenceEngine(BASE_DIR / "backend" / "signatures.json")
 runtime_errors: deque[dict] = deque(maxlen=500)
+sigint_store = SigintLogStore(SESSIONS_DIR / "sigint_log.db")
 auto_actions: list[dict] = [
     {
         "protocol_name": "Rolling Code (Keeloq)",
@@ -246,6 +248,7 @@ async def _startup() -> None:
         _safe_startup_probe()
     _bind_monitor_analysis_callback()
     asyncio.create_task(_autosave_loop())
+    await sigint_store.start()
     if os.getenv("SDR_WATCHDOG_ENABLED", "0") == "1":
         asyncio.create_task(_watchdog_loop())
 
@@ -254,6 +257,8 @@ async def _startup() -> None:
 async def _shutdown() -> None:
     """Release optional runtime resources."""
     global zmq_consumer
+    await sigint_store.stop()
+    sigint_store.close()
     if zmq_consumer is not None:
         zmq_consumer.close()
         zmq_consumer = None
@@ -333,6 +338,15 @@ class AutoActionPayload(BaseModel):
     trigger_power_dbm: float | None = None
     hysteresis_db: float = 3.0
     cooldown_seconds: float = 1.0
+
+
+class SigintTargetPayload(BaseModel):
+    label: str
+    center_frequency: float | None = None
+    tolerance_hz: float = 25_000
+    modulation_type: str | None = None
+    protocol_name: str | None = None
+
 
 # Optional reference to a running PassiveMonitor instance.  When present the
 # WebSocket spectrum endpoint will pull FFT slices from this monitor.  External
@@ -654,8 +668,47 @@ def _remember_signals(new_signals: List[Signal]) -> None:
             sig.likely_purpose = identify_signal(sig)
         _apply_auto_actions(sig)
         recent_signals.append(sig)
+        _capture_sigint_event(sig)
     signals.clear()
     signals.extend(list(recent_signals))
+
+
+def _estimate_signal_confidence(sig: Signal) -> float:
+    raw = getattr(sig, "confidence", None)
+    try:
+        if raw is not None:
+            return max(0.0, min(1.0, float(raw)))
+    except Exception:
+        pass
+    if getattr(sig, "protocol_name", None):
+        return 0.9
+    if getattr(sig, "modulation_type", None) and getattr(sig, "baud_rate", None):
+        return 0.75
+    return 0.4
+
+
+def _capture_sigint_event(sig: Signal) -> None:
+    confidence = _estimate_signal_confidence(sig)
+    if confidence < 0.7:
+        return
+    payload = getattr(sig, "label", None) or getattr(sig, "likely_purpose", None)
+    event = SigintEvent(
+        timestamp=float(getattr(sig, "end_time", None) or time.time()),
+        center_frequency=float(getattr(sig, "center_frequency", 0.0)),
+        bandwidth=float(getattr(sig, "bandwidth", 0.0)),
+        rssi_db=float(getattr(sig, "peak_power", 0.0)),
+        modulation_type=getattr(sig, "modulation_type", None),
+        baud_rate=getattr(sig, "baud_rate", None),
+        protocol_name=getattr(sig, "protocol_name", None),
+        decoded_payload=str(payload) if payload else None,
+        confidence=confidence,
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        loop.call_soon(sigint_store.enqueue, event)
+    except RuntimeError:
+        # If no active loop is available (tests / worker threads), persist directly.
+        sigint_store.ingest_now(event)
 
 
 def _apply_auto_actions(sig: Signal) -> None:
@@ -1262,6 +1315,65 @@ def remove_watchlist(frequency: float) -> dict:
     except ValueError as exc:  # pragma: no cover - rare edge case
         raise HTTPException(status_code=404, detail="Frequency not found") from exc
     return {"status": "ok"}
+
+
+@app.get("/api/sigint/log")
+def get_sigint_log(
+    limit: int = Query(200, ge=1, le=2000),
+    watchlist_only: bool = Query(False),
+    frequency: float | None = Query(None),
+) -> dict:
+    """Return recent SIGINT log rows with optional filtering."""
+    rows = sigint_store.fetch_entries(limit=limit, watchlist_only=watchlist_only, frequency=frequency)
+    return {"items": rows, "count": len(rows)}
+
+
+@app.get("/api/sigint/export")
+def export_sigint_log(
+    format: str = Query("json", pattern="^(json|csv)$"),
+    watchlist_only: bool = Query(False),
+) -> Response:
+    """Export SIGINT log as JSON or CSV."""
+    if format == "csv":
+        content = sigint_store.export_csv(watchlist_only=watchlist_only)
+        return Response(
+            content=content,
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=sigint_log.csv"},
+        )
+    content = sigint_store.export_json(watchlist_only=watchlist_only)
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=sigint_log.json"},
+    )
+
+
+@app.get("/api/sigint/targets")
+def list_sigint_targets() -> list[dict]:
+    """Return active watch targets for SIGINT hit detection."""
+    return sigint_store.list_targets()
+
+
+@app.post("/api/sigint/targets")
+def create_sigint_target(payload: SigintTargetPayload) -> dict:
+    """Create a new SIGINT watch target."""
+    return sigint_store.add_target(
+        label=payload.label.strip() or "Unnamed target",
+        center_frequency=payload.center_frequency,
+        tolerance_hz=payload.tolerance_hz,
+        modulation_type=payload.modulation_type,
+        protocol_name=payload.protocol_name,
+    )
+
+
+@app.delete("/api/sigint/targets/{target_id}")
+def delete_sigint_target(target_id: int) -> dict:
+    """Delete an existing SIGINT watch target."""
+    deleted = sigint_store.delete_target(target_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Target not found")
+    return {"status": "deleted", "target_id": target_id}
 
 
 @app.post("/api/hopping")
