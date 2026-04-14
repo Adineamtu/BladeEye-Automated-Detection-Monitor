@@ -57,6 +57,14 @@ python app_wrapper/build_standalone.py
 
 The resulting launcher starts `sdr_core` + FastAPI in the background, assigns a dynamic port, and opens the React UI in a native desktop window.
 
+
+## Vision & Roadmap
+
+- [BladeEye Evolution — Plan Structural](docs/bladeeye_evolution_plan.md)
+- [BladeEye Evolution — Varianta Recomandată de Implementare](docs/bladeeye_implementation_strategy.md)
+- [Execution Board (Operațional)](docs/execution_board.md)
+- [Foundation Phase Delivery](docs/foundation_phase_delivery.md)
+
 ## API endpoints (dev mode)
 
 - Web UI: <http://localhost:8000>
