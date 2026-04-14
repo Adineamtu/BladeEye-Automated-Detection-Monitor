@@ -44,7 +44,7 @@ struct RuntimeConfig {
     std::atomic<uint64_t> center_freq{433'920'000};
     std::atomic<float> threshold_db{-55.0f};
     std::atomic<float> gain_db{40.0f};
-    std::atomic<bool> stream_enabled{true};
+    std::atomic<bool> stream_enabled{false};
     std::atomic<uint32_t> dropped_samples{0};
 };
 
@@ -275,6 +275,10 @@ void command_listener(RuntimeConfig& cfg) {
                 float value = -60;
                 is >> value;
                 cfg.threshold_db.store(value);
+            } else if (command == "START") {
+                cfg.stream_enabled.store(true);
+            } else if (command == "STOP") {
+                cfg.stream_enabled.store(false);
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));

@@ -16,9 +16,10 @@ import inspect
 import asyncio
 import time
 import json
-import socket
+import socket as _socket
 import sys
 import struct
+from types import SimpleNamespace
 import numpy as np
 import io
 import base64
@@ -85,6 +86,7 @@ recordings: List[dict] = []
 recent_signals: deque[Signal] = deque(maxlen=50)
 alert_subscribers: set[asyncio.Queue] = set()
 log = logging.getLogger(__name__)
+socket = SimpleNamespace(socket=_socket.socket, AF_UNIX=_socket.AF_UNIX, SOCK_DGRAM=_socket.SOCK_DGRAM)
 
 
 def _configure_file_logging() -> None:
@@ -152,6 +154,7 @@ async def _startup() -> None:
                 _recovery_cache = json.load(fh)
         except Exception:
             _recovery_cache = None
+    _safe_startup_probe()
     _bind_monitor_analysis_callback()
     asyncio.create_task(_autosave_loop())
     if os.getenv("SDR_WATCHDOG_ENABLED", "0") == "1":
@@ -253,6 +256,20 @@ SPECTRUM_HEADER_SIZE = struct.calcsize(SPECTRUM_HEADER_FORMAT)
 SPECTRUM_BINS = 2048
 MAX_PEAKS = 64
 FRAME_SIZE = SPECTRUM_HEADER_SIZE + (SPECTRUM_BINS * 4) + (MAX_PEAKS * 2 * 4)
+EXPECTED_RING_CONTROL_SIZE = 24
+EXPECTED_SPECTRUM_HEADER_SIZE = 56
+
+
+def _write_plain_startup_debug(message: str) -> None:
+    """Write startup diagnostics without depending on logging bootstrap."""
+    try:
+        logs_dir = Path("logs")
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        with open(logs_dir / "debug_startup.txt", "a", encoding="utf-8") as fh:
+            ts = datetime.datetime.utcnow().isoformat()
+            fh.write(f"[{ts}Z] {message}\n")
+    except Exception:
+        pass
 
 
 def _read_latest_sdr_core_frame() -> tuple[dict, np.ndarray]:
@@ -322,6 +339,24 @@ def _read_sdr_core_header() -> dict:
     return header
 
 
+def _safe_startup_probe() -> None:
+    """Validate SHM structure sizes and optionally probe mapped memory."""
+    try:
+        if RING_CONTROL_SIZE != EXPECTED_RING_CONTROL_SIZE:
+            raise RuntimeError(
+                f"SharedRingControl mismatch: python={RING_CONTROL_SIZE} expected={EXPECTED_RING_CONTROL_SIZE}"
+            )
+        if SPECTRUM_HEADER_SIZE != EXPECTED_SPECTRUM_HEADER_SIZE:
+            raise RuntimeError(
+                f"SharedSpectrumHeader mismatch: python={SPECTRUM_HEADER_SIZE} expected={EXPECTED_SPECTRUM_HEADER_SIZE}"
+            )
+        if os.path.exists(SHM_PATH):
+            _read_latest_sdr_core_frame()
+    except Exception as exc:
+        _write_plain_startup_debug(f"SHM probe failed: {exc!r}")
+        log.exception("SHM startup probe failed")
+
+
 def _recover_sdr_core() -> None:
     """Best-effort restart path when watchdog detects stale heartbeat."""
     proc_name = "sdr_core"
@@ -367,6 +402,17 @@ def _push_sample_rate_command(value: float) -> None:
         sock.sendto(payload, SDR_CORE_CMD_SOCKET)
     except OSError:
         # Optional integration path: API remains functional if C++ core is absent.
+        log.debug("C++ command socket unavailable at %s", SDR_CORE_CMD_SOCKET)
+    finally:
+        sock.close()
+
+
+def _push_core_command(command: str) -> None:
+    """Send START/STOP commands to C++ core socket."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(command.encode("ascii"), SDR_CORE_CMD_SOCKET)
+    except OSError:
         log.debug("C++ command socket unavailable at %s", SDR_CORE_CMD_SOCKET)
     finally:
         sock.close()
@@ -605,35 +651,39 @@ def save_session(name: str, session: SessionPayload) -> dict:
 @app.post("/api/scan/start")
 def start_scan() -> dict:
     """Start or resume the SDR monitor."""
-    if monitor is None:
-        raise HTTPException(status_code=503, detail="Monitor not configured")
-    if getattr(monitor, "is_running", False):
+    monitor_running = bool(monitor is not None and getattr(monitor, "is_running", False))
+    if monitor_running:
         raise HTTPException(status_code=409, detail="Monitor already running")
     log.info("Received start scan command")
-    _bind_monitor_analysis_callback()
-    if hasattr(monitor, "start"):
-        monitor.start()
-    elif hasattr(monitor, "resume"):
-        monitor.resume()
-    setattr(monitor, "is_running", True)
+    if monitor is not None:
+        _bind_monitor_analysis_callback()
+        if hasattr(monitor, "start"):
+            monitor.start()
+        elif hasattr(monitor, "resume"):
+            monitor.resume()
+        setattr(monitor, "is_running", True)
+    _push_core_command("START")
     return {"is_running": True}
 
 
 @app.post("/api/scan/stop")
 def stop_scan() -> dict:
     """Stop the SDR monitor."""
-    if monitor is None:
-        raise HTTPException(status_code=503, detail="Monitor not configured")
-    if not getattr(monitor, "is_running", False):
+    monitor_running = bool(monitor is not None and getattr(monitor, "is_running", False))
+    if monitor is None and not os.path.exists(SDR_CORE_CMD_SOCKET):
+        raise HTTPException(status_code=409, detail="Monitor not running")
+    if monitor is not None and not monitor_running:
         raise HTTPException(status_code=409, detail="Monitor not running")
     log.info("Received stop scan command")
-    if hasattr(monitor, "stop"):
-        monitor.stop()
-        if hasattr(monitor, "wait"):
-            monitor.wait()
-    elif hasattr(monitor, "halt"):
-        monitor.halt()
-    setattr(monitor, "is_running", False)
+    if monitor is not None:
+        if hasattr(monitor, "stop"):
+            monitor.stop()
+            if hasattr(monitor, "wait"):
+                monitor.wait()
+        elif hasattr(monitor, "halt"):
+            monitor.halt()
+        setattr(monitor, "is_running", False)
+    _push_core_command("STOP")
     return {"is_running": False}
 
 
@@ -1122,4 +1172,9 @@ if FRONTEND_DIST.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app)
+    uvicorn.run(
+        app,
+        host=os.getenv("BLADEEYE_API_HOST", "127.0.0.1"),
+        port=int(os.getenv("BLADEEYE_API_PORT", "43101")),
+        log_level="info",
+    )
