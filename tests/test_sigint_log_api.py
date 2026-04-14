@@ -84,3 +84,47 @@ def test_sigint_sessionizing_deduplicates_recent_hits():
     rows = api.sigint_store.fetch_entries(limit=20, frequency=915_000_000)
     assert rows
     assert rows[0]["hit_count"] >= 2
+
+
+def test_sigint_fhss_session_tracks_hop_analytics():
+    with api.sigint_store._lock:
+        api.sigint_store._conn.execute("DELETE FROM sigint_log")
+        api.sigint_store._conn.commit()
+        api.sigint_store._active_sessions.clear()
+    now = time.time()
+    base_event = api.SigintEvent(
+        timestamp=now,
+        center_frequency=2_401_000_000,
+        bandwidth=80_000,
+        rssi_db=-44.0,
+        modulation_type="FSK",
+        baud_rate=250_000,
+        protocol_name="FHSS-Node",
+        decoded_payload="sync-xy",
+        confidence=0.96,
+        sync_word="AA55",
+    )
+    hop_event = api.SigintEvent(
+        timestamp=now + 0.08,
+        center_frequency=2_402_500_000,
+        bandwidth=80_000,
+        rssi_db=-42.0,
+        modulation_type="FSK",
+        baud_rate=250_000,
+        protocol_name="FHSS-Node",
+        decoded_payload="sync-xy",
+        confidence=0.97,
+        sync_word="AA55",
+    )
+    api.sigint_store.ingest_now(base_event)
+    api.sigint_store.ingest_now(hop_event)
+    rows = api.sigint_store.fetch_entries(limit=10)
+    assert rows
+    entry = rows[0]
+    assert entry["session_uid"]
+    assert entry["session_state"] == "ACTIVE"
+    assert entry["hop_count"] >= 1
+    assert entry["base_frequency"] == base_event.center_frequency
+    assert entry["hop_min_frequency"] <= base_event.center_frequency
+    assert entry["hop_max_frequency"] >= hop_event.center_frequency
+    assert "2401" in (entry["hop_frequencies_json"] or "")
