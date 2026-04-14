@@ -48,6 +48,7 @@ from backend.execution_board import (
 )
 from backend.preflight import PreflightStatus, run_preflight
 from backend.zmq_bridge import ZmqSpectrumConsumer
+from backend.intelligence_engine import IntelligenceEngine
 
 # ``Signal`` is defined in ``HackRF.passive_monitor`` which pulls in heavy
 # dependencies like GNU Radio.  Import it lazily and provide a lightweight
@@ -118,6 +119,27 @@ def _configure_file_logging() -> None:
 
 _configure_file_logging()
 
+
+class _RuntimeErrorBufferHandler(logging.Handler):
+    """Store recent runtime errors for in-app diagnostics panel."""
+
+    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - logging side effect
+        if record.levelno < logging.ERROR:
+            return
+        runtime_errors.append(
+            {
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                "logger": record.name,
+                "level": record.levelname,
+                "message": self.format(record),
+            }
+        )
+
+
+_runtime_error_handler = _RuntimeErrorBufferHandler(level=logging.ERROR)
+_runtime_error_handler.setFormatter(logging.Formatter("%(message)s"))
+logging.getLogger().addHandler(_runtime_error_handler)
+
 # Directory on disk used for persisting session JSON files.
 SESSIONS_DIR = Path("sessions")
 AUTOSAVE_FILE = SESSIONS_DIR / "autosave.json"
@@ -126,6 +148,15 @@ EXECUTION_BOARD_FILE = SESSIONS_DIR / "execution_board.json"
 execution_board: ExecutionBoard | None = None
 preflight_status: PreflightStatus | None = None
 zmq_consumer: ZmqSpectrumConsumer | None = None
+intelligence_engine = IntelligenceEngine(BASE_DIR / "backend" / "signatures.json")
+runtime_errors: deque[dict] = deque(maxlen=500)
+auto_actions: list[dict] = [
+    {
+        "protocol_name": "Rolling Code (Keeloq)",
+        "action": "arm_recording",
+        "duration_after": 0.75,
+    }
+]
 
 
 async def _autosave_loop() -> None:
@@ -173,16 +204,15 @@ async def _startup() -> None:
     config_state["hardware_detected"] = preflight_status.hardware_detected
     config_state["usb_access_ok"] = preflight_status.usb_access_ok
 
-    if os.getenv("BLADEEYE_DATA_BRIDGE", "").lower() == "zmq":
+    bridge_mode = os.getenv("BLADEEYE_DATA_BRIDGE", "zmq").lower()
+    if bridge_mode == "zmq":
         zmq_endpoint = os.getenv("BLADEEYE_ZMQ_ENDPOINT", DEFAULT_ZMQ_SPECTRUM_ENDPOINT)
         zmq_consumer = ZmqSpectrumConsumer(zmq_endpoint)
-        if zmq_consumer.enabled:
-            config_state["data_bridge"] = "zmq"
-        else:
-            config_state["data_bridge"] = "demo"
+        config_state["data_bridge"] = "zmq" if zmq_consumer.enabled else "demo"
     else:
-        config_state["data_bridge"] = "shm"
-    _safe_startup_probe()
+        config_state["data_bridge"] = "demo"
+    if os.getenv("BLADEEYE_ENABLE_LEGACY_SHM", "0") == "1":
+        _safe_startup_probe()
     _bind_monitor_analysis_callback()
     asyncio.create_task(_autosave_loop())
     if os.getenv("SDR_WATCHDOG_ENABLED", "0") == "1":
@@ -259,6 +289,17 @@ class ExecutionTaskPatchPayload(BaseModel):
     owner: str | None = None
     notes: str | None = None
 
+
+class IntelligenceIQPayload(BaseModel):
+    iq_real: List[float]
+    iq_imag: List[float]
+
+
+class AutoActionPayload(BaseModel):
+    protocol_name: str
+    action: str = "arm_recording"
+    duration_after: float = 0.75
+
 # Optional reference to a running PassiveMonitor instance.  When present the
 # WebSocket spectrum endpoint will pull FFT slices from this monitor.  External
 # code is expected to set this variable after creating the PassiveMonitor.
@@ -276,7 +317,7 @@ config_state: dict[str, float | int | bool | str | None] = {
     "runtime_mode": "demo",
     "hardware_detected": False,
     "usb_access_ok": False,
-    "data_bridge": "shm",
+    "data_bridge": "zmq",
 }
 
 # Discrete sample-rate values supported by the UI slider and recommended for
@@ -556,9 +597,28 @@ def _serialize_execution_board(board: ExecutionBoard) -> dict:
 def _remember_signals(new_signals: List[Signal]) -> None:
     """Persist latest detections in a circular in-memory buffer."""
     for sig in new_signals:
+        if getattr(sig, "likely_purpose", None) is None:
+            sig.likely_purpose = identify_signal(sig)
+        _apply_auto_actions(sig)
         recent_signals.append(sig)
     signals.clear()
     signals.extend(list(recent_signals))
+
+
+def _apply_auto_actions(sig: Signal) -> None:
+    """Execute deterministic rule-actions for high-confidence matches."""
+    for rule in auto_actions:
+        protocol_name = rule.get("protocol_name")
+        if protocol_name and getattr(sig, "protocol_name", None) != protocol_name:
+            continue
+        if rule.get("action") == "arm_recording" and monitor is not None and hasattr(monitor, "arm_recording"):
+            try:
+                monitor.arm_recording(
+                    sig.center_frequency,
+                    duration_after=float(rule.get("duration_after", 0.5)),
+                )
+            except Exception:
+                log.exception("Failed auto action arm_recording for %s", sig.center_frequency)
 
 
 def _bind_monitor_analysis_callback() -> None:
@@ -1028,6 +1088,25 @@ def get_frequency_trace(frequency: float) -> dict:
     return {"times": times, "frequencies": freqs}
 
 
+@app.post("/api/intelligence/classify")
+async def classify_iq(payload: IntelligenceIQPayload) -> dict:
+    """Analyze an IQ window and infer modulation, RSSI, baud and fingerprint."""
+    if len(payload.iq_real) != len(payload.iq_imag):
+        raise HTTPException(status_code=422, detail="iq_real and iq_imag must have equal length")
+    if not payload.iq_real:
+        raise HTTPException(status_code=422, detail="IQ payload cannot be empty")
+    iq = np.asarray(payload.iq_real, dtype=np.float32) + 1j * np.asarray(payload.iq_imag, dtype=np.float32)
+    result = await intelligence_engine.analyze(iq)
+    return {
+        "modulation_type": result.modulation_type,
+        "signal_strength_rssi_db": result.rssi_db,
+        "baud_rate": result.baud_rate,
+        "likely_purpose": result.likely_purpose,
+        "protocol_name": result.protocol_name,
+        "confidence": result.confidence,
+    }
+
+
 @app.get("/api/signals/{frequency}/iq")
 def export_signal_iq(frequency: float) -> StreamingResponse:
     """Stream raw I/Q samples for *frequency* as binary data."""
@@ -1093,6 +1172,20 @@ def set_hopping(cfg: HoppingPayload) -> dict:
     return config_state
 
 
+@app.get("/api/actions")
+def get_auto_actions() -> dict:
+    """Return protocol-triggered automatic action rules."""
+    return {"items": auto_actions}
+
+
+@app.post("/api/actions")
+def add_auto_action(payload: AutoActionPayload) -> dict:
+    """Add a new protocol-triggered action rule."""
+    item = payload.model_dump()
+    auto_actions.append(item)
+    return item
+
+
 @app.get("/api/config")
 def get_config() -> dict:
     """Return current SDR configuration."""
@@ -1103,14 +1196,31 @@ def get_config() -> dict:
 
 @app.get("/api/health")
 def get_health() -> dict:
-    """Return runtime health telemetry exported by the SDR C++ core."""
+    """Return runtime health telemetry exported by active data bridge."""
     if config_state.get("runtime_mode") == "demo":
+        telemetry = zmq_consumer.telemetry() if zmq_consumer is not None else {}
         return {
             "healthy": True,
             "mode": "demo",
             "heartbeat_age_seconds": None,
-            "dropped_samples": 0,
-            "buffer_fill_percent": 0.0,
+            "dropped_samples": int(telemetry.get("dropped_frames", 0)),
+            "buffer_fill_percent": float(telemetry.get("buffer_load_percent", 0.0)),
+            "throughput_bps": float(telemetry.get("throughput_bps", 0.0)),
+        }
+    if zmq_consumer is not None and zmq_consumer.enabled:
+        telemetry = zmq_consumer.telemetry()
+        stale_for = None
+        if telemetry.get("last_frame_ts"):
+            stale_for = max(0.0, time.time() - float(telemetry["last_frame_ts"]))
+        healthy = stale_for is None or stale_for <= WATCHDOG_STALE_SECONDS
+        return {
+            "healthy": healthy,
+            "mode": "hardware",
+            "heartbeat_age_seconds": stale_for,
+            "dropped_samples": int(telemetry.get("dropped_frames", 0)),
+            "buffer_fill_percent": float(telemetry.get("buffer_load_percent", 0.0)),
+            "throughput_bps": float(telemetry.get("throughput_bps", 0.0)),
+            "frames_received": int(telemetry.get("frames_received", 0)),
         }
     try:
         header = _read_sdr_core_header()
@@ -1127,6 +1237,27 @@ def get_health() -> dict:
         "heartbeat_age_seconds": stale_for,
         "healthy": healthy,
     }
+
+
+@app.get("/api/telemetry")
+def get_telemetry() -> dict:
+    """Return consolidated telemetry for dashboard widgets."""
+    zmq_data = zmq_consumer.telemetry() if zmq_consumer is not None else {"enabled": False}
+    return {
+        "runtime_mode": config_state.get("runtime_mode"),
+        "data_bridge": config_state.get("data_bridge"),
+        "buffer_load_percent": float(zmq_data.get("buffer_load_percent", 0.0)),
+        "zmq_throughput_bps": float(zmq_data.get("throughput_bps", 0.0)),
+        "zmq_fps": float(zmq_data.get("fps", 0.0)),
+        "dropped_frames": int(zmq_data.get("dropped_frames", 0)),
+        "alerts_subscribers": len(alert_subscribers),
+    }
+
+
+@app.get("/api/logs")
+def get_runtime_logs(limit: int = Query(100, ge=1, le=500)) -> dict:
+    """Return recent consolidated runtime errors (api + preflight)."""
+    return {"items": list(runtime_errors)[-limit:]}
 
 
 @app.get("/api/preflight")
@@ -1267,9 +1398,6 @@ async def spectrum_stream(websocket: WebSocket) -> None:
                     spectrum = zmq_consumer.recv_latest()
                     if spectrum is not None:
                         spectrum = np.asarray(spectrum, dtype=float)
-                if spectrum is None:
-                    _, shm_spectrum = _read_latest_sdr_core_frame()
-                    spectrum = np.asarray(shm_spectrum, dtype=float)
                 if spectrum.size == 0 or not np.isfinite(spectrum).all():
                     await asyncio.sleep(frame_delay)
                     continue
@@ -1310,10 +1438,7 @@ async def spectrum_stream_binary(websocket: WebSocket) -> None:
                 spectrum = None
                 if zmq_consumer is not None and zmq_consumer.enabled:
                     spectrum = zmq_consumer.recv_latest()
-                if spectrum is None:
-                    _, shm_spectrum = _read_latest_sdr_core_frame()
-                    spectrum = np.asarray(shm_spectrum, dtype=np.float32)
-                else:
+                if spectrum is not None:
                     spectrum = np.asarray(spectrum, dtype=np.float32)
                 if spectrum.size == 0 or not np.isfinite(spectrum).all():
                     await asyncio.sleep(frame_delay)

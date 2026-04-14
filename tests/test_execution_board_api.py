@@ -14,7 +14,7 @@ def test_execution_board_bootstraps_default(tmp_path):
     resp = client.get('/api/execution-board')
     assert resp.status_code == 200
     data = resp.json()
-    assert data['board_name'] == 'BladeEye Evolution Execution Board'
+    assert data['board_name'] == 'BladeEye Final Execution Board'
     assert len(data['tasks']) >= 1
     assert api.EXECUTION_BOARD_FILE.exists()
 
