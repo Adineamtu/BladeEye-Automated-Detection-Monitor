@@ -1,6 +1,6 @@
 """FastAPI backend for exposing SDR monitoring data."""
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -25,6 +25,7 @@ import io
 import base64
 import datetime
 import logging
+import zipfile
 from logging.handlers import RotatingFileHandler
 import matplotlib.pyplot as plt
 from weasyprint import HTML
@@ -132,6 +133,7 @@ class _RuntimeErrorBufferHandler(logging.Handler):
                 "logger": record.name,
                 "level": record.levelname,
                 "message": self.format(record),
+                "system_snapshot": _runtime_snapshot(),
             }
         )
 
@@ -157,6 +159,34 @@ auto_actions: list[dict] = [
         "duration_after": 0.75,
     }
 ]
+_auto_action_state: dict[str, bool] = {}
+_last_action_trigger_at: dict[str, float] = {}
+_ai_last_activity_ts: float = 0.0
+_ai_jobs_processed: int = 0
+
+
+def _runtime_snapshot() -> dict:
+    """Capture lightweight runtime state for post-mortem diagnostics."""
+    cfg = globals().get("config_state", {}) or {}
+    consumer = globals().get("zmq_consumer")
+    telemetry = consumer.telemetry() if consumer is not None else {}
+    return {
+        "runtime_mode": cfg.get("runtime_mode"),
+        "data_bridge": cfg.get("data_bridge"),
+        "center_frequency_hz": cfg.get("center_freq"),
+        "gain_db": cfg.get("gain"),
+        "sample_rate_hz": cfg.get("samp_rate"),
+        "buffer_load_percent": telemetry.get("buffer_load_percent"),
+        "dropped_frames": telemetry.get("dropped_frames"),
+        "zmq_throughput_bps": telemetry.get("throughput_bps"),
+    }
+
+
+def _mark_ai_activity() -> None:
+    """Record a heartbeat for intelligence workload indicators."""
+    global _ai_last_activity_ts, _ai_jobs_processed
+    _ai_last_activity_ts = time.time()
+    _ai_jobs_processed += 1
 
 
 async def _autosave_loop() -> None:
@@ -200,6 +230,7 @@ async def _startup() -> None:
             _recovery_cache = None
     execution_board = load_execution_board(EXECUTION_BOARD_FILE)
     preflight_status = run_preflight()
+    _sync_firmware_warning_on_execution_board()
     config_state["runtime_mode"] = preflight_status.mode
     config_state["hardware_detected"] = preflight_status.hardware_detected
     config_state["usb_access_ok"] = preflight_status.usb_access_ok
@@ -299,6 +330,9 @@ class AutoActionPayload(BaseModel):
     protocol_name: str
     action: str = "arm_recording"
     duration_after: float = 0.75
+    trigger_power_dbm: float | None = None
+    hysteresis_db: float = 3.0
+    cooldown_seconds: float = 1.0
 
 # Optional reference to a running PassiveMonitor instance.  When present the
 # WebSocket spectrum endpoint will pull FFT slices from this monitor.  External
@@ -594,8 +628,27 @@ def _serialize_execution_board(board: ExecutionBoard) -> dict:
     }
 
 
+def _sync_firmware_warning_on_execution_board() -> None:
+    """Project preflight firmware warnings onto the hardware task notes."""
+    global execution_board, preflight_status
+    if execution_board is None or preflight_status is None:
+        return
+    hardware_task = next((task for task in execution_board.tasks if task.id == "P1-T1"), None)
+    if hardware_task is None:
+        return
+    warning = preflight_status.firmware_warning
+    base_notes = hardware_task.notes.split("\nWARNING: firmware ")[0].rstrip()
+    if warning:
+        hardware_task.notes = f"{base_notes}\nWARNING: firmware {warning}".strip()
+    else:
+        hardware_task.notes = base_notes
+    save_execution_board(EXECUTION_BOARD_FILE, execution_board)
+
+
 def _remember_signals(new_signals: List[Signal]) -> None:
     """Persist latest detections in a circular in-memory buffer."""
+    if new_signals:
+        _mark_ai_activity()
     for sig in new_signals:
         if getattr(sig, "likely_purpose", None) is None:
             sig.likely_purpose = identify_signal(sig)
@@ -611,12 +664,35 @@ def _apply_auto_actions(sig: Signal) -> None:
         protocol_name = rule.get("protocol_name")
         if protocol_name and getattr(sig, "protocol_name", None) != protocol_name:
             continue
+        trigger_power = rule.get("trigger_power_dbm")
+        hysteresis_db = float(rule.get("hysteresis_db", 3.0))
+        cooldown_seconds = float(rule.get("cooldown_seconds", 1.0))
+        key = f"{rule.get('action')}::{protocol_name or '*'}::{round(float(sig.center_frequency), 1)}"
+        is_active = _auto_action_state.get(key, False)
+
+        if trigger_power is not None:
+            try:
+                threshold = float(trigger_power)
+                signal_power = float(getattr(sig, "peak_power", -999.0))
+            except Exception:
+                continue
+            if is_active and signal_power < (threshold - hysteresis_db):
+                _auto_action_state[key] = False
+                is_active = False
+            if signal_power < threshold:
+                continue
+            _auto_action_state[key] = True
+
+        now = time.time()
+        if now - _last_action_trigger_at.get(key, 0.0) < cooldown_seconds:
+            continue
         if rule.get("action") == "arm_recording" and monitor is not None and hasattr(monitor, "arm_recording"):
             try:
                 monitor.arm_recording(
                     sig.center_frequency,
                     duration_after=float(rule.get("duration_after", 0.5)),
                 )
+                _last_action_trigger_at[key] = now
             except Exception:
                 log.exception("Failed auto action arm_recording for %s", sig.center_frequency)
 
@@ -1097,6 +1173,7 @@ async def classify_iq(payload: IntelligenceIQPayload) -> dict:
         raise HTTPException(status_code=422, detail="IQ payload cannot be empty")
     iq = np.asarray(payload.iq_real, dtype=np.float32) + 1j * np.asarray(payload.iq_imag, dtype=np.float32)
     result = await intelligence_engine.analyze(iq)
+    _mark_ai_activity()
     return {
         "modulation_type": result.modulation_type,
         "signal_strength_rssi_db": result.rssi_db,
@@ -1104,6 +1181,35 @@ async def classify_iq(payload: IntelligenceIQPayload) -> dict:
         "likely_purpose": result.likely_purpose,
         "protocol_name": result.protocol_name,
         "confidence": result.confidence,
+        "snr_db": result.snr_db,
+        "ignored_as_noise": result.ignored_as_noise,
+    }
+
+
+@app.post("/api/intelligence/classify-file")
+async def classify_iq_file(request: Request, filename: str = Query("uploaded_iq.complex")) -> dict:
+    """Analyze uploaded complex64 IQ file in demo/offline workflows."""
+    payload = await request.body()
+    if not payload:
+        raise HTTPException(status_code=422, detail="Uploaded IQ file is empty")
+    if len(payload) % 8 != 0:
+        raise HTTPException(status_code=422, detail="IQ file must contain complex64 samples")
+    iq = np.frombuffer(payload, dtype=np.complex64)
+    if iq.size == 0:
+        raise HTTPException(status_code=422, detail="IQ file has no valid samples")
+    result = await intelligence_engine.analyze(iq)
+    _mark_ai_activity()
+    return {
+        "filename": filename,
+        "samples": int(iq.size),
+        "modulation_type": result.modulation_type,
+        "signal_strength_rssi_db": result.rssi_db,
+        "baud_rate": result.baud_rate,
+        "likely_purpose": result.likely_purpose,
+        "protocol_name": result.protocol_name,
+        "confidence": result.confidence,
+        "snr_db": result.snr_db,
+        "ignored_as_noise": result.ignored_as_noise,
     }
 
 
@@ -1249,8 +1355,11 @@ def get_telemetry() -> dict:
         "buffer_load_percent": float(zmq_data.get("buffer_load_percent", 0.0)),
         "zmq_throughput_bps": float(zmq_data.get("throughput_bps", 0.0)),
         "zmq_fps": float(zmq_data.get("fps", 0.0)),
+        "zmq_latency_ms": float(zmq_data.get("latency_ms", 0.0)),
         "dropped_frames": int(zmq_data.get("dropped_frames", 0)),
         "alerts_subscribers": len(alert_subscribers),
+        "ai_jobs_processed": _ai_jobs_processed,
+        "ai_last_activity_ts": _ai_last_activity_ts or None,
     }
 
 
@@ -1260,17 +1369,37 @@ def get_runtime_logs(limit: int = Query(100, ge=1, le=500)) -> dict:
     return {"items": list(runtime_errors)[-limit:]}
 
 
+@app.get("/api/logs/export")
+def export_runtime_logs() -> StreamingResponse:
+    """Export runtime error ring-buffer and file logs into one zip archive."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("runtime_errors.json", json.dumps({"items": list(runtime_errors)}, indent=2))
+        api_log = Path("logs") / "api_error.log"
+        if api_log.exists():
+            zf.write(api_log, arcname="api_error.log")
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="bladeeye_runtime_logs.zip"'},
+    )
+
+
 @app.get("/api/preflight")
 def get_preflight_status() -> dict:
     """Expose startup hardware/USB validation and runtime mode selection."""
     global preflight_status
     if preflight_status is None:
         preflight_status = run_preflight()
+        _sync_firmware_warning_on_execution_board()
     return {
         "hardware_detected": preflight_status.hardware_detected,
         "usb_access_ok": preflight_status.usb_access_ok,
         "runtime_mode": preflight_status.mode,
         "detail": preflight_status.detail,
+        "firmware_version": preflight_status.firmware_version,
+        "firmware_warning": preflight_status.firmware_warning,
         "data_bridge": config_state.get("data_bridge"),
     }
 

@@ -28,6 +28,8 @@ class ZmqSpectrumConsumer:
         self._window_bytes = 0
         self.fps = 0.0
         self.throughput_bps = 0.0
+        self.latency_ms = 0.0
+        self._spectrum_bins = 512
         if zmq is None:
             return
         self._ctx = zmq.Context.instance()
@@ -40,6 +42,7 @@ class ZmqSpectrumConsumer:
         if not self.enabled or self._sock is None or zmq is None:
             return None
 
+        loop_started = time.time()
         latest = None
         dropped = 0
         while True:
@@ -56,7 +59,12 @@ class ZmqSpectrumConsumer:
         if dropped:
             self.dropped_frames += dropped
 
-        frame = np.frombuffer(latest, dtype=np.float32).copy()
+        frames = self._extract_frames(latest)
+        if not frames:
+            return None
+        if len(frames) > 1:
+            self.dropped_frames += len(frames) - 1
+        frame = frames[-1]
         if frame.size == 0 or not np.isfinite(frame).all():
             return None
         now = time.time()
@@ -72,7 +80,20 @@ class ZmqSpectrumConsumer:
             self._window_started = now
             self._window_frames = 0
             self._window_bytes = 0
+        self.latency_ms = max(0.0, (now - loop_started) * 1000.0)
         return frame
+
+    def _extract_frames(self, payload: bytes) -> list[np.ndarray]:
+        """Decode one or more float32 spectrum frames from one payload."""
+        if len(payload) % 4 != 0:
+            return []
+        values = np.frombuffer(payload, dtype=np.float32)
+        if values.size == 0:
+            return []
+        if values.size % self._spectrum_bins == 0 and values.size > self._spectrum_bins:
+            chunks = values.reshape((-1, self._spectrum_bins))
+            return [np.array(chunk, dtype=np.float32, copy=True) for chunk in chunks]
+        return [np.array(values, dtype=np.float32, copy=True)]
 
     def telemetry(self) -> dict:
         """Return current throughput and queue pressure estimations."""
@@ -84,6 +105,7 @@ class ZmqSpectrumConsumer:
                 "throughput_bps": 0.0,
                 "fps": 0.0,
                 "buffer_load_percent": 0.0,
+                "latency_ms": 0.0,
             }
         buffer_load = min(100.0, max(0.0, float(self.dropped_frames) * 2.0))
         return {
@@ -94,6 +116,7 @@ class ZmqSpectrumConsumer:
             "dropped_frames": self.dropped_frames,
             "throughput_bps": round(self.throughput_bps, 2),
             "fps": round(self.fps, 2),
+            "latency_ms": round(self.latency_ms, 3),
             "buffer_load_percent": round(buffer_load, 2),
             "last_frame_ts": self.last_frame_ts,
         }

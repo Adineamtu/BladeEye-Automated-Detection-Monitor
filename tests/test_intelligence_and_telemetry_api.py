@@ -15,6 +15,22 @@ def test_intelligence_classify_endpoint_returns_inference_payload():
     assert "modulation_type" in data
     assert "signal_strength_rssi_db" in data
     assert "confidence" in data
+    assert "snr_db" in data
+    assert "ignored_as_noise" in data
+
+
+def test_intelligence_classify_file_endpoint_accepts_complex64_upload():
+    client = TestClient(api.app)
+    iq_bytes = (b"\x00\x00\x80?\x00\x00\x00\x00" * 16)  # complex64(1+0j) * 16
+    resp = client.post(
+        "/api/intelligence/classify-file?filename=demo.complex",
+        content=iq_bytes,
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["samples"] == 16
+    assert "snr_db" in data
 
 
 def test_telemetry_and_logs_endpoints_are_available():
@@ -24,10 +40,15 @@ def test_telemetry_and_logs_endpoints_are_available():
     tdata = telemetry.json()
     assert "buffer_load_percent" in tdata
     assert "zmq_throughput_bps" in tdata
+    assert "ai_jobs_processed" in tdata
 
     logs = client.get("/api/logs?limit=5")
     assert logs.status_code == 200
     assert "items" in logs.json()
+
+    zipped = client.get("/api/logs/export")
+    assert zipped.status_code == 200
+    assert zipped.headers["content-type"] == "application/zip"
 
 
 def test_auto_actions_endpoint_adds_rule():
