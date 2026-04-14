@@ -369,10 +369,19 @@ def _safe_startup_probe() -> None:
                     if "Latest shared-memory slot is not ready" not in str(exc):
                         raise
                     if time.monotonic() >= deadline:
-                        raise RuntimeError(
-                            "Latest shared-memory slot remained not ready "
-                            f"for {SHM_STARTUP_PROBE_TIMEOUT_SECONDS:.1f}s"
-                        ) from exc
+                        # Legitimate case: C++ core is up but stream has not been
+                        # started yet (no ready frame to read). Defer hard-failure
+                        # until the health endpoint is actually queried.
+                        _write_plain_startup_debug(
+                            "SHM probe deferred: shared-memory slot not ready yet "
+                            f"after {SHM_STARTUP_PROBE_TIMEOUT_SECONDS:.1f}s "
+                            "(expected before first START)"
+                        )
+                        log.info(
+                            "SHM startup probe deferred: no ready slot yet after %.1fs",
+                            SHM_STARTUP_PROBE_TIMEOUT_SECONDS,
+                        )
+                        return
                     time.sleep(SHM_STARTUP_POLL_INTERVAL_SECONDS)
     except Exception as exc:
         _write_plain_startup_debug(f"SHM probe failed: {exc!r}")
