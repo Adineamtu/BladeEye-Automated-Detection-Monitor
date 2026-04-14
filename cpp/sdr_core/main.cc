@@ -39,13 +39,22 @@ constexpr std::size_t kRingCapacity = 128;
 constexpr std::size_t kAverageFrames = 8;
 
 struct RuntimeConfig {
-    std::atomic<uint32_t> sample_rate{20'000'000};
-    std::atomic<uint32_t> analog_bandwidth{16'000'000};
-    std::atomic<uint64_t> center_freq{433'920'000};
-    std::atomic<float> threshold_db{-55.0f};
-    std::atomic<float> gain_db{40.0f};
-    std::atomic<bool> stream_enabled{false};
-    std::atomic<uint32_t> dropped_samples{0};
+    RuntimeConfig()
+        : sample_rate(20'000'000),
+          analog_bandwidth(16'000'000),
+          center_freq(433'920'000),
+          threshold_db(-55.0f),
+          gain_db(40.0f),
+          stream_enabled(false),
+          dropped_samples(0) {}
+
+    std::atomic<uint32_t> sample_rate;
+    std::atomic<uint32_t> analog_bandwidth;
+    std::atomic<uint64_t> center_freq;
+    std::atomic<float> threshold_db;
+    std::atomic<float> gain_db;
+    std::atomic<bool> stream_enabled;
+    std::atomic<uint32_t> dropped_samples;
 };
 
 constexpr std::array<uint32_t, 5> kAllowedSampleRates = {
@@ -68,7 +77,8 @@ void apply_sample_rate_reconfiguration(RuntimeConfig& cfg, uint32_t requested_ra
     }
 
     const auto previous = cfg.sample_rate.load();
-    cfg.stream_enabled.store(false);                  // stop stream
+    const bool was_streaming = cfg.stream_enabled.load();
+    cfg.stream_enabled.store(false);                  // stop stream during reconfiguration
     cfg.sample_rate.store(requested_rate);            // set sample rate
     cfg.analog_bandwidth.store(requested_rate * 4U / 5U);  // set analog BW to 0.8x
 
@@ -76,7 +86,9 @@ void apply_sample_rate_reconfiguration(RuntimeConfig& cfg, uint32_t requested_ra
     if (delta >= 10'000'000) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    cfg.stream_enabled.store(true);  // restart stream
+    // Preserve previous run-state: changing presets/bandwidth while stopped must
+    // not implicitly start acquisition.
+    cfg.stream_enabled.store(was_streaming);
 }
 
 struct SampleChunk {
@@ -278,6 +290,7 @@ void command_listener(RuntimeConfig& cfg) {
             } else if (command == "START") {
                 // Hardware/startup handoff is intentionally tied to START so the
                 // core avoids touching SDR resources before explicit user intent.
+                cfg.dropped_samples.store(0, std::memory_order_relaxed);
                 cfg.stream_enabled.store(true);
             } else if (command == "STOP") {
                 cfg.stream_enabled.store(false);
