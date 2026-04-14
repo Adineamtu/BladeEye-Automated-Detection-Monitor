@@ -30,6 +30,16 @@ function App() {
     buffer_fill_percent: 0,
     dropped_samples: 0,
   });
+  const [preflight, setPreflight] = useState({
+    runtime_mode: 'demo',
+    data_bridge: 'zmq',
+  });
+  const [telemetry, setTelemetry] = useState({
+    buffer_load_percent: 0,
+    zmq_throughput_bps: 0,
+    dropped_frames: 0,
+  });
+  const [runtimeLogs, setRuntimeLogs] = useState([]);
 
   useEffect(() => {
     async function fetchWatchlist() {
@@ -42,6 +52,43 @@ function App() {
       }
     }
     fetchWatchlist();
+  }, []);
+
+  useEffect(() => {
+    async function fetchPreflight() {
+      try {
+        const res = await fetch('/api/preflight');
+        if (!res.ok) throw new Error('Preflight endpoint unavailable');
+        setPreflight(await res.json());
+      } catch (err) {
+        console.debug('Preflight unavailable', err);
+      }
+    }
+    fetchPreflight();
+  }, []);
+
+  useEffect(() => {
+    let timer;
+    async function fetchTelemetry() {
+      try {
+        const [telemetryRes, logsRes] = await Promise.all([
+          fetch('/api/telemetry'),
+          fetch('/api/logs?limit=8'),
+        ]);
+        if (telemetryRes.ok) {
+          setTelemetry(await telemetryRes.json());
+        }
+        if (logsRes.ok) {
+          const logsPayload = await logsRes.json();
+          setRuntimeLogs(logsPayload.items || []);
+        }
+      } catch (err) {
+        console.debug('Telemetry/logs unavailable', err);
+      }
+    }
+    fetchTelemetry();
+    timer = setInterval(fetchTelemetry, 1000);
+    return () => clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -178,6 +225,11 @@ function App() {
 
   return (
     <div className="App">
+      {preflight.runtime_mode === 'demo' && (
+        <div className="simulation-banner">
+          Running in Simulation Mode - No Hardware Detected
+        </div>
+      )}
       {alert && (
         <div className="alert-banner">
           <span>{alert}</span>
@@ -209,6 +261,12 @@ function App() {
         <span className={`status-led ${health.healthy ? 'connected' : 'disconnected'}`} />
         SDR Core: {health.healthy ? 'Healthy' : 'Offline / Stale heartbeat'} · Buffer Load:{' '}
         {health.buffer_fill_percent.toFixed(1)}% · Dropped: {health.dropped_samples}
+      </div>
+      <div className="system-health">
+        Data Bridge: {(preflight.data_bridge || telemetry.data_bridge || 'demo').toUpperCase()} · Buffer
+        Load: {(telemetry.buffer_load_percent || 0).toFixed(1)}% · ZMQ Throughput:{' '}
+        {Math.round((telemetry.zmq_throughput_bps || 0) / 1000)} kbps · Dropped Frames:{' '}
+        {telemetry.dropped_frames || 0}
       </div>
       <div className="ws-heartbeat">
         <span
@@ -250,6 +308,18 @@ function App() {
             watchlist={watchlist}
             config={config}
           />
+          <section className="runtime-logs-panel">
+            <h3>Runtime Error Logs</h3>
+            {runtimeLogs.length === 0 ? (
+              <div className="runtime-log-item muted">No recent runtime errors.</div>
+            ) : (
+              runtimeLogs.map((entry, idx) => (
+                <div className="runtime-log-item" key={`${entry.timestamp}-${idx}`}>
+                  [{entry.level}] {entry.logger}: {entry.message}
+                </div>
+              ))
+            )}
+          </section>
         </>
       )}
       <footer className="app-footer">

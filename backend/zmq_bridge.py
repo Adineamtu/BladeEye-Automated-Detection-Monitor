@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import time
 
 try:  # pragma: no cover - exercised only where pyzmq exists
     import zmq
@@ -18,6 +19,15 @@ class ZmqSpectrumConsumer:
         self._ctx = None
         self._sock = None
         self.enabled = False
+        self.frames_received = 0
+        self.bytes_received = 0
+        self.dropped_frames = 0
+        self.last_frame_ts = 0.0
+        self._window_started = time.time()
+        self._window_frames = 0
+        self._window_bytes = 0
+        self.fps = 0.0
+        self.throughput_bps = 0.0
         if zmq is None:
             return
         self._ctx = zmq.Context.instance()
@@ -31,20 +41,62 @@ class ZmqSpectrumConsumer:
             return None
 
         latest = None
+        dropped = 0
         while True:
             try:
                 payload = self._sock.recv(flags=zmq.NOBLOCK)
+                if latest is not None:
+                    dropped += 1
                 latest = payload
             except zmq.Again:
                 break
 
         if latest is None:
             return None
+        if dropped:
+            self.dropped_frames += dropped
 
         frame = np.frombuffer(latest, dtype=np.float32).copy()
         if frame.size == 0 or not np.isfinite(frame).all():
             return None
+        now = time.time()
+        self.frames_received += 1
+        self.bytes_received += len(latest)
+        self._window_frames += 1
+        self._window_bytes += len(latest)
+        self.last_frame_ts = now
+        elapsed = now - self._window_started
+        if elapsed >= 1.0:
+            self.fps = self._window_frames / elapsed
+            self.throughput_bps = (self._window_bytes * 8.0) / elapsed
+            self._window_started = now
+            self._window_frames = 0
+            self._window_bytes = 0
         return frame
+
+    def telemetry(self) -> dict:
+        """Return current throughput and queue pressure estimations."""
+        if not self.enabled:
+            return {
+                "enabled": False,
+                "frames_received": 0,
+                "dropped_frames": 0,
+                "throughput_bps": 0.0,
+                "fps": 0.0,
+                "buffer_load_percent": 0.0,
+            }
+        buffer_load = min(100.0, max(0.0, float(self.dropped_frames) * 2.0))
+        return {
+            "enabled": True,
+            "endpoint": self.endpoint,
+            "frames_received": self.frames_received,
+            "bytes_received": self.bytes_received,
+            "dropped_frames": self.dropped_frames,
+            "throughput_bps": round(self.throughput_bps, 2),
+            "fps": round(self.fps, 2),
+            "buffer_load_percent": round(buffer_load, 2),
+            "last_frame_ts": self.last_frame_ts,
+        }
 
     def close(self) -> None:
         """Close socket resources."""

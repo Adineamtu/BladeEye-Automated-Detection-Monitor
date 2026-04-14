@@ -11,7 +11,7 @@ def test_preflight_endpoint_exposes_runtime_mode():
         mode='demo',
         detail='Fallback demo',
     )
-    api.config_state['data_bridge'] = 'shm'
+    api.config_state['data_bridge'] = 'zmq'
     client = TestClient(api.app)
 
     resp = client.get('/api/preflight')
@@ -19,7 +19,7 @@ def test_preflight_endpoint_exposes_runtime_mode():
     data = resp.json()
     assert data['runtime_mode'] == 'demo'
     assert data['hardware_detected'] is False
-    assert data['data_bridge'] == 'shm'
+    assert data['data_bridge'] == 'zmq'
 
 
 def test_health_returns_demo_payload_when_runtime_mode_is_demo():
