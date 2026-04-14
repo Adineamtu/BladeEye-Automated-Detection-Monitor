@@ -244,19 +244,36 @@ std::vector<float> hann_window() {
 
 void acquisition_thread(sdr::SpscRingBuffer<SampleChunk, kRingCapacity>& ring, RuntimeConfig& cfg) {
     SyntheticSource source;
+    auto next_deadline = std::chrono::steady_clock::now();
     while (g_running.load()) {
         if (!cfg.stream_enabled.load()) {
+            next_deadline = std::chrono::steady_clock::now();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
         SampleChunk chunk;
-        if (!source.read_chunk(chunk, cfg.sample_rate.load(), cfg.center_freq.load())) {
+        const auto sample_rate = cfg.sample_rate.load();
+        if (!source.read_chunk(chunk, sample_rate, cfg.center_freq.load())) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             continue;
         }
         while (!ring.push(chunk) && g_running.load()) {
             cfg.dropped_samples.fetch_add(1, std::memory_order_relaxed);
             std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+
+        // Pace synthetic capture to real-time. Without this, producer pushes as
+        // fast as CPU allows, saturates the SPSC ring, and reports continuous
+        // dropped-sample growth despite healthy processing.
+        const auto frame_ns = std::chrono::nanoseconds(
+            static_cast<int64_t>((1'000'000'000.0 * static_cast<double>(kFftSize)) /
+                                 static_cast<double>(std::max<uint32_t>(sample_rate, 1))));
+        next_deadline += frame_ns;
+        const auto now = std::chrono::steady_clock::now();
+        if (next_deadline > now) {
+            std::this_thread::sleep_until(next_deadline);
+        } else {
+            next_deadline = now;
         }
     }
 }

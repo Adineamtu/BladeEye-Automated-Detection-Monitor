@@ -210,6 +210,8 @@ function WaterfallPlot({
     const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
     let ws;
     let usingBinary = true;
+    let reconnectTimer = null;
+    let disposed = false;
     const rowHeight = 1; // each spectrum occupies one pixel vertically
     const handleSpectrumData = (data) => {
       if (onSpectrumFrame) onSpectrumFrame();
@@ -250,6 +252,14 @@ function WaterfallPlot({
         }
       });
     };
+    const scheduleReconnect = (binary) => {
+      if (disposed || reconnectTimer) return;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!disposed) connect(binary);
+      }, 1000);
+    };
+
     const connect = (binary) => {
       usingBinary = binary;
       const endpoint = binary ? '/ws/spectrum/binary' : '/ws/spectrum';
@@ -264,6 +274,8 @@ function WaterfallPlot({
         if (onSocketStateChange) onSocketStateChange(false);
         if (binary) {
           connect(false);
+        } else {
+          scheduleReconnect(true);
         }
       };
       ws.onerror = () => {
@@ -285,6 +297,8 @@ function WaterfallPlot({
     connect(true);
 
     return () => {
+      disposed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       if (ws) ws.close();
     };
   }, [colorScale, onSocketStateChange, onSpectrumFrame]);
