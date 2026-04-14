@@ -9,20 +9,16 @@ import os
 import socket
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Iterable
 
 import requests
-import uvicorn
 from PySide6.QtCore import QCoreApplication, QTimer, QUrl
 from PySide6.QtGui import QIcon
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox
-from api import app
-
 WINDOW_TITLE = "Reactive Jamming Monitor"
 DEFAULT_HOST = "127.0.0.1"
 API_HEALTH_ENDPOINT = "/api/config"
@@ -31,25 +27,6 @@ SHM_BUFFER_PATH = Path("/dev/shm/bladeeye_buffer")
 
 class LauncherError(RuntimeError):
     """Raised when the standalone stack cannot be initialized."""
-
-
-class APIServerThread(threading.Thread):
-    """Runs uvicorn in background and allows graceful shutdown."""
-
-    def __init__(self, host: str, port: int) -> None:
-        super().__init__(daemon=True)
-        self.host = host
-        self.port = port
-        self.server: uvicorn.Server | None = None
-
-    def run(self) -> None:
-        config = uvicorn.Config(app, host=self.host, port=self.port, log_level="critical")
-        self.server = uvicorn.Server(config)
-        self.server.run()
-
-    def stop(self) -> None:
-        if self.server is not None:
-            self.server.should_exit = True
 
 
 class BladeEyeWindow(QMainWindow):
@@ -184,6 +161,37 @@ def _wait_for_api(base_url: str, timeout_s: float = 20.0) -> None:
     raise LauncherError(f"API nu a pornit la timp pe {base_url}. Ultima eroare: {last_error}")
 
 
+def _api_process_command(host: str, port: int) -> list[str]:
+    """Return command used to launch the API in both source and frozen modes."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--api-only", "--api-host", host, "--port", str(port)]
+    return [sys.executable, str(Path(__file__).resolve()), "--api-only", "--api-host", host, "--port", str(port)]
+
+
+def _start_api_process(host: str, port: int, logs_dir: Path) -> subprocess.Popen:
+    """Start API subprocess and pipe stdout/stderr to startup log."""
+    startup_log = open(logs_dir / "debug_startup.txt", "a", encoding="utf-8")
+    cmd = _api_process_command(host, port)
+    startup_log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] starting API: {' '.join(cmd)}\n")
+    startup_log.flush()
+    return subprocess.Popen(
+        cmd,
+        stdout=startup_log,
+        stderr=subprocess.STDOUT,
+        env=os.environ.copy(),
+        creationflags=_silent_creation_flags(),
+    )
+
+
+def _run_api_only(host: str, port: int) -> int:
+    """Entry point used by subprocess mode (and by frozen bundle)."""
+    import uvicorn
+    from api import app
+
+    uvicorn.run(app, host=host, port=port, log_level="info")
+    return 0
+
+
 def _terminate_process(proc: subprocess.Popen | None) -> None:
     if proc is None or proc.poll() is not None:
         return
@@ -217,13 +225,17 @@ def run() -> int:
     parser.add_argument("--port", type=int, default=0, help="Port API; 0 = auto")
     parser.add_argument("--api-host", default=DEFAULT_HOST)
     parser.add_argument("--no-core", action="store_true", help="Skip C++ SDR core startup")
+    parser.add_argument("--api-only", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args.api_only:
+        return _run_api_only(args.api_host, args.port)
 
     api_port = args.port if args.port > 0 else _find_free_port()
     api_url = f"http://{args.api_host}:{api_port}"
 
     core_proc: subprocess.Popen | None = None
-    api_thread: APIServerThread | None = None
+    api_proc: subprocess.Popen | None = None
     engine_log = None
     try:
         _configure_qt_runtime()
@@ -245,8 +257,7 @@ def run() -> int:
         launcher_env["FRONTEND_DIST"] = str(frontend_dist)
         os.environ.update(launcher_env)
 
-        api_thread = APIServerThread(args.api_host, api_port)
-        api_thread.start()
+        api_proc = _start_api_process(args.api_host, api_port, logs_dir)
         _wait_for_api(api_url)
 
         qt_app = QApplication(sys.argv)
@@ -263,10 +274,7 @@ def run() -> int:
         _show_error_dialog(f"Eroare la inițializare: {exc}")
         return 1
     finally:
-        if api_thread:
-            api_thread.stop()
-            api_thread.join(timeout=4)
-        _stop_processes(core_proc)
+        _stop_processes(api_proc, core_proc)
         if engine_log is not None:
             engine_log.close()
 
