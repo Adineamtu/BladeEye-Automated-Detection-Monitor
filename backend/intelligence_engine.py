@@ -2,13 +2,58 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import json
 import math
 
 import numpy as np
+
+
+def _analyze_sync_worker(iq: np.ndarray, signatures: list[dict], snr_guard_db: float) -> "IntelligenceResult":
+    iq = np.asarray(iq, dtype=np.complex64)
+    if iq.size == 0:
+        return IntelligenceResult("UNKNOWN", -120.0, None, None, None, 0.0, 0.0, True)
+
+    power = np.abs(iq) ** 2
+    rssi_db = float(10.0 * np.log10(float(np.mean(power)) + 1e-12))
+    noise_power = float(np.percentile(power, 20))
+    signal_power = float(np.percentile(power, 90))
+    snr_db = float(10.0 * np.log10((signal_power + 1e-12) / (noise_power + 1e-12)))
+    if snr_db < snr_guard_db:
+        return IntelligenceResult("NOISE", rssi_db, None, None, None, 0.0, snr_db, True)
+
+    amp_var = float(np.var(np.abs(iq)))
+    phase = np.unwrap(np.angle(iq))
+    freq_dev = np.diff(phase)
+    freq_var = float(np.var(freq_dev)) if freq_dev.size else 0.0
+    cyclo_score = IntelligenceEngine._cyclostationary_score(iq)
+
+    if freq_var > amp_var * 1.8:
+        modulation = "FSK"
+    elif amp_var > freq_var * 1.8:
+        modulation = "ASK"
+    elif freq_var > 0.02:
+        modulation = "FM"
+    else:
+        modulation = "AM"
+
+    baud = IntelligenceEngine._estimate_baud_rate(iq)
+    likely_purpose, protocol_name, confidence = IntelligenceEngine._fingerprint_static(signatures, modulation, baud)
+    confidence = round(min(1.0, max(confidence, cyclo_score)), 3)
+
+    return IntelligenceResult(
+        modulation_type=modulation,
+        rssi_db=rssi_db,
+        baud_rate=baud,
+        likely_purpose=likely_purpose,
+        protocol_name=protocol_name,
+        confidence=confidence,
+        snr_db=snr_db,
+        ignored_as_noise=False,
+    )
 
 
 @dataclass
@@ -29,9 +74,17 @@ class IntelligenceEngine:
     """Best-effort asynchronous classifier for low-latency SDR UX updates."""
 
     def __init__(self, signatures_path: Path, snr_guard_db: float = 6.0) -> None:
-        self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bladeeye-intel")
+        self._pool = self._build_executor()
         self._signatures = self._load_signatures(signatures_path)
         self._snr_guard_db = float(snr_guard_db)
+
+    @staticmethod
+    def _build_executor() -> Executor:
+        workers = max(2, int(os.getenv("BLADEEYE_INTEL_WORKERS", "2")))
+        mode = os.getenv("BLADEEYE_INTEL_EXECUTOR", "thread").strip().lower()
+        if mode == "process":
+            return ProcessPoolExecutor(max_workers=workers)
+        return ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bladeeye-intel")
 
     @staticmethod
     def _load_signatures(path: Path) -> list[dict]:
@@ -47,50 +100,10 @@ class IntelligenceEngine:
         import asyncio
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._pool, self._analyze_sync, iq)
+        return await loop.run_in_executor(self._pool, _analyze_sync_worker, iq, self._signatures, self._snr_guard_db)
 
     def _analyze_sync(self, iq: np.ndarray) -> IntelligenceResult:
-        iq = np.asarray(iq, dtype=np.complex64)
-        if iq.size == 0:
-            return IntelligenceResult("UNKNOWN", -120.0, None, None, None, 0.0, 0.0, True)
-
-        power = np.abs(iq) ** 2
-        rssi_db = float(10.0 * np.log10(float(np.mean(power)) + 1e-12))
-        noise_power = float(np.percentile(power, 20))
-        signal_power = float(np.percentile(power, 90))
-        snr_db = float(10.0 * np.log10((signal_power + 1e-12) / (noise_power + 1e-12)))
-        if snr_db < self._snr_guard_db:
-            return IntelligenceResult("NOISE", rssi_db, None, None, None, 0.0, snr_db, True)
-
-        amp_var = float(np.var(np.abs(iq)))
-        phase = np.unwrap(np.angle(iq))
-        freq_dev = np.diff(phase)
-        freq_var = float(np.var(freq_dev)) if freq_dev.size else 0.0
-        cyclo_score = self._cyclostationary_score(iq)
-
-        if freq_var > amp_var * 1.8:
-            modulation = "FSK"
-        elif amp_var > freq_var * 1.8:
-            modulation = "ASK"
-        elif freq_var > 0.02:
-            modulation = "FM"
-        else:
-            modulation = "AM"
-
-        baud = self._estimate_baud_rate(iq)
-        likely_purpose, protocol_name, confidence = self._fingerprint(modulation, baud)
-        confidence = round(min(1.0, max(confidence, cyclo_score)), 3)
-
-        return IntelligenceResult(
-            modulation_type=modulation,
-            rssi_db=rssi_db,
-            baud_rate=baud,
-            likely_purpose=likely_purpose,
-            protocol_name=protocol_name,
-            confidence=confidence,
-            snr_db=snr_db,
-            ignored_as_noise=False,
-        )
+        return _analyze_sync_worker(iq, self._signatures, self._snr_guard_db)
 
     @staticmethod
     def _cyclostationary_score(iq: np.ndarray) -> float:
@@ -130,10 +143,16 @@ class IntelligenceEngine:
         return round(1_000_000.0 / max(avg_samples, 1.0), 2)
 
     def _fingerprint(self, modulation: str, baud_rate: float | None) -> tuple[str | None, str | None, float]:
+        return self._fingerprint_static(self._signatures, modulation, baud_rate)
+
+    @staticmethod
+    def _fingerprint_static(
+        signatures: list[dict], modulation: str, baud_rate: float | None
+    ) -> tuple[str | None, str | None, float]:
         if baud_rate is None:
             return None, None, 0.0
         best: tuple[dict, float] | None = None
-        for signature in self._signatures:
+        for signature in signatures:
             if str(signature.get("modulation_type", "")).upper() != modulation.upper():
                 continue
             target = signature.get("baud_rate")

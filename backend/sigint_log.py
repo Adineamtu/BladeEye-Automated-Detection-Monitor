@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Iterable
 
 
 @dataclass(slots=True)
@@ -56,12 +57,16 @@ class SigintLogStore:
         session_timeout_seconds: float = 2.0,
         hop_correlation_window_ms: float = 250.0,
         max_active_sessions: int = 20,
+        write_batch_size: int = 64,
+        write_flush_interval_ms: float = 40.0,
     ) -> None:
         self.db_path = Path(db_path)
         self.dedupe_window_seconds = float(dedupe_window_seconds)
         self.session_timeout_seconds = float(session_timeout_seconds)
         self.hop_correlation_window_ms = float(hop_correlation_window_ms)
         self.max_active_sessions = max(1, int(max_active_sessions))
+        self.write_batch_size = max(1, int(write_batch_size))
+        self.write_flush_interval_s = max(0.001, float(write_flush_interval_ms) / 1000.0)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
@@ -73,6 +78,9 @@ class SigintLogStore:
     def _init_schema(self) -> None:
         with self._lock:
             cur = self._conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA synchronous=NORMAL")
+            cur.execute("PRAGMA temp_store=MEMORY")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sigint_log (
@@ -170,110 +178,124 @@ class SigintLogStore:
     async def _worker(self) -> None:
         while True:
             event = await self._queue.get()
-            try:
-                self._upsert_event(event)
-            finally:
+            batch: list[SigintEvent] = [event]
+            started = time.monotonic()
+            while len(batch) < self.write_batch_size:
+                remaining = self.write_flush_interval_s - (time.monotonic() - started)
+                if remaining <= 0:
+                    break
+                try:
+                    next_event = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                    batch.append(next_event)
+                except TimeoutError:
+                    break
+            self._upsert_batch(batch)
+            for _ in batch:
                 self._queue.task_done()
 
     def ingest_now(self, event: SigintEvent) -> None:
         self._upsert_event(event)
 
     def _upsert_event(self, event: SigintEvent) -> None:
+        self._upsert_batch([event])
+
+    def _upsert_batch(self, events: Iterable[SigintEvent]) -> None:
         with self._lock:
             cur = self._conn.cursor()
-            self._expire_sessions(cur, event.timestamp)
-            modulation = (event.modulation_type or "").upper()
-            protocol = event.protocol_name or ""
-            payload = event.decoded_payload or ""
-            signature = self._build_signature(event, modulation, protocol, payload)
-            session = self._bind_session(signature, event)
-            cur.execute(
-                """
-                SELECT id, rssi_db, confidence, hit_count
-                FROM sigint_log
-                WHERE IFNULL(session_uid, '') = ?
-                  AND (? - last_seen_ts) <= ?
-                ORDER BY last_seen_ts DESC
-                LIMIT 1
-                """,
-                (session.uid, event.timestamp, self.session_timeout_seconds),
-            )
-            row = cur.fetchone()
-            watch_hit = 1 if self._target_match(cur, event) else 0
-            if row:
+            for event in events:
+                self._expire_sessions(cur, event.timestamp)
+                modulation = (event.modulation_type or "").upper()
+                protocol = event.protocol_name or ""
+                payload = event.decoded_payload or ""
+                signature = self._build_signature(event, modulation, protocol, payload)
+                session = self._bind_session(signature, event)
                 cur.execute(
                     """
-                    UPDATE sigint_log
-                    SET last_seen_ts = ?,
-                        hit_count = hit_count + 1,
-                        rssi_db = CASE WHEN rssi_db IS NULL THEN ? ELSE MAX(rssi_db, ?) END,
-                        confidence = MAX(confidence, ?),
-                        bandwidth = COALESCE(?, bandwidth),
-                        baud_rate = COALESCE(?, baud_rate),
-                        center_frequency = ?,
-                        base_frequency = ?,
-                        hop_min_frequency = ?,
-                        hop_max_frequency = ?,
-                        hop_count = ?,
-                        dwell_time_ms = ?,
-                        hop_frequencies_json = ?,
-                        signal_signature = ?,
-                        session_state = 'ACTIVE',
-                        watchlist_hit = CASE WHEN watchlist_hit = 1 OR ? = 1 THEN 1 ELSE 0 END
-                    WHERE id = ?
+                    SELECT id, rssi_db, confidence, hit_count
+                    FROM sigint_log
+                    WHERE IFNULL(session_uid, '') = ?
+                    AND (? - last_seen_ts) <= ?
+                    ORDER BY last_seen_ts DESC
+                    LIMIT 1
                     """,
-                    (
-                        event.timestamp,
-                        event.rssi_db,
-                        event.rssi_db,
-                        event.confidence,
-                        event.bandwidth,
-                        event.baud_rate,
-                        event.center_frequency,
-                        session.base_frequency,
-                        session.min_frequency,
-                        session.max_frequency,
-                        session.hop_count,
-                        session.dwell_time_ms,
-                        json.dumps(session.frequencies),
-                        signature,
-                        watch_hit,
-                        int(row["id"]),
-                    ),
+                    (session.uid, event.timestamp, self.session_timeout_seconds),
                 )
-            else:
-                cur.execute(
-                    """
-                    INSERT INTO sigint_log (
-                        first_seen_ts, last_seen_ts, center_frequency, bandwidth, rssi_db,
-                        modulation_type, baud_rate, protocol_name, decoded_payload, confidence,
-                        watchlist_hit, session_uid, signal_signature, session_state,
-                        base_frequency, hop_min_frequency, hop_max_frequency, hop_count,
-                        dwell_time_ms, hop_frequencies_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        event.timestamp,
-                        event.timestamp,
-                        event.center_frequency,
-                        event.bandwidth,
-                        event.rssi_db,
-                        modulation or None,
-                        event.baud_rate,
-                        event.protocol_name,
-                        event.decoded_payload,
-                        event.confidence,
-                        watch_hit,
-                        session.uid,
-                        signature,
-                        session.base_frequency,
-                        session.min_frequency,
-                        session.max_frequency,
-                        session.hop_count,
-                        session.dwell_time_ms,
-                        json.dumps(session.frequencies),
-                    ),
-                )
+                row = cur.fetchone()
+                watch_hit = 1 if self._target_match(cur, event) else 0
+                if row:
+                    cur.execute(
+                        """
+                        UPDATE sigint_log
+                        SET last_seen_ts = ?,
+                            hit_count = hit_count + 1,
+                            rssi_db = CASE WHEN rssi_db IS NULL THEN ? ELSE MAX(rssi_db, ?) END,
+                            confidence = MAX(confidence, ?),
+                            bandwidth = COALESCE(?, bandwidth),
+                            baud_rate = COALESCE(?, baud_rate),
+                            center_frequency = ?,
+                            base_frequency = ?,
+                            hop_min_frequency = ?,
+                            hop_max_frequency = ?,
+                            hop_count = ?,
+                            dwell_time_ms = ?,
+                            hop_frequencies_json = ?,
+                            signal_signature = ?,
+                            session_state = 'ACTIVE',
+                            watchlist_hit = CASE WHEN watchlist_hit = 1 OR ? = 1 THEN 1 ELSE 0 END
+                        WHERE id = ?
+                        """,
+                        (
+                            event.timestamp,
+                            event.rssi_db,
+                            event.rssi_db,
+                            event.confidence,
+                            event.bandwidth,
+                            event.baud_rate,
+                            event.center_frequency,
+                            session.base_frequency,
+                            session.min_frequency,
+                            session.max_frequency,
+                            session.hop_count,
+                            session.dwell_time_ms,
+                            json.dumps(session.frequencies),
+                            signature,
+                            watch_hit,
+                            int(row["id"]),
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO sigint_log (
+                            first_seen_ts, last_seen_ts, center_frequency, bandwidth, rssi_db,
+                            modulation_type, baud_rate, protocol_name, decoded_payload, confidence,
+                            watchlist_hit, session_uid, signal_signature, session_state,
+                            base_frequency, hop_min_frequency, hop_max_frequency, hop_count,
+                            dwell_time_ms, hop_frequencies_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            event.timestamp,
+                            event.timestamp,
+                            event.center_frequency,
+                            event.bandwidth,
+                            event.rssi_db,
+                            modulation or None,
+                            event.baud_rate,
+                            event.protocol_name,
+                            event.decoded_payload,
+                            event.confidence,
+                            watch_hit,
+                            session.uid,
+                            signature,
+                            session.base_frequency,
+                            session.min_frequency,
+                            session.max_frequency,
+                            session.hop_count,
+                            session.dwell_time_ms,
+                            json.dumps(session.frequencies),
+                        ),
+                    )
             self._conn.commit()
 
     def _build_signature(self, event: SigintEvent, modulation: str, protocol: str, payload: str) -> str:
