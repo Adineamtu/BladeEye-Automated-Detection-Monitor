@@ -39,6 +39,15 @@ from backend.protocols import (
     save_user_protocol,
     load_user_protocols,
 )
+from backend.execution_board import (
+    ExecutionBoard,
+    ExecutionTask,
+    load_execution_board,
+    save_execution_board,
+    update_task as update_execution_task,
+)
+from backend.preflight import PreflightStatus, run_preflight
+from backend.zmq_bridge import ZmqSpectrumConsumer
 
 # ``Signal`` is defined in ``HackRF.passive_monitor`` which pulls in heavy
 # dependencies like GNU Radio.  Import it lazily and provide a lightweight
@@ -113,6 +122,10 @@ _configure_file_logging()
 SESSIONS_DIR = Path("sessions")
 AUTOSAVE_FILE = SESSIONS_DIR / "autosave.json"
 _recovery_cache: dict | None = None
+EXECUTION_BOARD_FILE = SESSIONS_DIR / "execution_board.json"
+execution_board: ExecutionBoard | None = None
+preflight_status: PreflightStatus | None = None
+zmq_consumer: ZmqSpectrumConsumer | None = None
 
 
 async def _autosave_loop() -> None:
@@ -147,18 +160,42 @@ jinja_env = Environment(
 async def _startup() -> None:
     """Initialize autosave and preload any recovery data."""
     SESSIONS_DIR.mkdir(exist_ok=True)
-    global _recovery_cache
+    global _recovery_cache, execution_board, preflight_status, zmq_consumer
     if AUTOSAVE_FILE.exists():
         try:
             with open(AUTOSAVE_FILE, "r", encoding="utf-8") as fh:
                 _recovery_cache = json.load(fh)
         except Exception:
             _recovery_cache = None
+    execution_board = load_execution_board(EXECUTION_BOARD_FILE)
+    preflight_status = run_preflight()
+    config_state["runtime_mode"] = preflight_status.mode
+    config_state["hardware_detected"] = preflight_status.hardware_detected
+    config_state["usb_access_ok"] = preflight_status.usb_access_ok
+
+    if os.getenv("BLADEEYE_DATA_BRIDGE", "").lower() == "zmq":
+        zmq_endpoint = os.getenv("BLADEEYE_ZMQ_ENDPOINT", DEFAULT_ZMQ_SPECTRUM_ENDPOINT)
+        zmq_consumer = ZmqSpectrumConsumer(zmq_endpoint)
+        if zmq_consumer.enabled:
+            config_state["data_bridge"] = "zmq"
+        else:
+            config_state["data_bridge"] = "demo"
+    else:
+        config_state["data_bridge"] = "shm"
     _safe_startup_probe()
     _bind_monitor_analysis_callback()
     asyncio.create_task(_autosave_loop())
     if os.getenv("SDR_WATCHDOG_ENABLED", "0") == "1":
         asyncio.create_task(_watchdog_loop())
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    """Release optional runtime resources."""
+    global zmq_consumer
+    if zmq_consumer is not None:
+        zmq_consumer.close()
+        zmq_consumer = None
 
 
 class SignalPayload(BaseModel):
@@ -216,6 +253,12 @@ class UserProtocolPayload(BaseModel):
     header_pattern: str
     data_field_structure: dict[str, list[int]]
 
+
+class ExecutionTaskPatchPayload(BaseModel):
+    status: str | None = None
+    owner: str | None = None
+    notes: str | None = None
+
 # Optional reference to a running PassiveMonitor instance.  When present the
 # WebSocket spectrum endpoint will pull FFT slices from this monitor.  External
 # code is expected to set this variable after creating the PassiveMonitor.
@@ -223,13 +266,17 @@ monitor: Optional[object] = None
 
 # Current SDR configuration.  When ``monitor`` is running these values are
 # kept in sync with the hardware via its setter methods.
-config_state: dict[str, float | int | bool | None] = {
+config_state: dict[str, float | int | bool | str | None] = {
     "center_freq": None,
     "samp_rate": None,
     "fft_size": 1024,
     "gain": None,
     "hopping_enabled": False,
     "alert_threshold": None,
+    "runtime_mode": "demo",
+    "hardware_detected": False,
+    "usb_access_ok": False,
+    "data_bridge": "shm",
 }
 
 # Discrete sample-rate values supported by the UI slider and recommended for
@@ -249,6 +296,7 @@ WATCHDOG_STALE_SECONDS = 1.0
 SHM_RING_VERSION = 1
 SHM_STARTUP_PROBE_TIMEOUT_SECONDS = 3.0
 SHM_STARTUP_POLL_INTERVAL_SECONDS = 0.1
+DEFAULT_ZMQ_SPECTRUM_ENDPOINT = "tcp://127.0.0.1:5557"
 
 
 RING_CONTROL_FORMAT = "<IIQQ"
@@ -479,6 +527,30 @@ def publish_alert(alert: dict) -> None:
             queue.put_nowait(alert)
         except Exception:
             pass
+
+
+def _serialize_execution_task(task: ExecutionTask) -> dict:
+    """Return JSON-ready task payload."""
+    return {
+        "id": task.id,
+        "phase": task.phase,
+        "title": task.title,
+        "description": task.description,
+        "owner": task.owner,
+        "status": task.status,
+        "acceptance_criteria": task.acceptance_criteria,
+        "notes": task.notes,
+    }
+
+
+def _serialize_execution_board(board: ExecutionBoard) -> dict:
+    """Return JSON-ready execution board payload."""
+    return {
+        "version": board.version,
+        "board_name": board.board_name,
+        "updated_at": board.updated_at,
+        "tasks": [_serialize_execution_task(task) for task in board.tasks],
+    }
 
 
 def _remember_signals(new_signals: List[Signal]) -> None:
@@ -1032,6 +1104,14 @@ def get_config() -> dict:
 @app.get("/api/health")
 def get_health() -> dict:
     """Return runtime health telemetry exported by the SDR C++ core."""
+    if config_state.get("runtime_mode") == "demo":
+        return {
+            "healthy": True,
+            "mode": "demo",
+            "heartbeat_age_seconds": None,
+            "dropped_samples": 0,
+            "buffer_fill_percent": 0.0,
+        }
     try:
         header = _read_sdr_core_header()
     except FileNotFoundError:
@@ -1047,6 +1127,59 @@ def get_health() -> dict:
         "heartbeat_age_seconds": stale_for,
         "healthy": healthy,
     }
+
+
+@app.get("/api/preflight")
+def get_preflight_status() -> dict:
+    """Expose startup hardware/USB validation and runtime mode selection."""
+    global preflight_status
+    if preflight_status is None:
+        preflight_status = run_preflight()
+    return {
+        "hardware_detected": preflight_status.hardware_detected,
+        "usb_access_ok": preflight_status.usb_access_ok,
+        "runtime_mode": preflight_status.mode,
+        "detail": preflight_status.detail,
+        "data_bridge": config_state.get("data_bridge"),
+    }
+
+
+@app.get("/api/execution-board")
+def get_execution_board() -> dict:
+    """Return the current implementation execution board."""
+    global execution_board
+    if execution_board is None:
+        execution_board = load_execution_board(EXECUTION_BOARD_FILE)
+    return _serialize_execution_board(execution_board)
+
+
+@app.patch("/api/execution-board/tasks/{task_id}")
+def patch_execution_task(task_id: str, payload: ExecutionTaskPatchPayload) -> dict:
+    """Update execution task progress (status/owner/notes)."""
+    global execution_board
+    if execution_board is None:
+        execution_board = load_execution_board(EXECUTION_BOARD_FILE)
+
+    status = payload.status
+    if status is not None and status not in {"todo", "in_progress", "blocked", "done"}:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid status. Allowed: todo, in_progress, blocked, done.",
+        )
+
+    try:
+        task = update_execution_task(
+            execution_board,
+            task_id,
+            status=status,  # type: ignore[arg-type]
+            owner=payload.owner,
+            notes=payload.notes,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Task not found") from exc
+
+    save_execution_board(EXECUTION_BOARD_FILE, execution_board)
+    return _serialize_execution_task(task)
 
 
 @app.post("/api/config")
@@ -1129,8 +1262,14 @@ async def spectrum_stream(websocket: WebSocket) -> None:
     try:
         while True:
             try:
-                _, spectrum = _read_latest_sdr_core_frame()
-                spectrum = np.asarray(spectrum, dtype=float)
+                spectrum = None
+                if zmq_consumer is not None and zmq_consumer.enabled:
+                    spectrum = zmq_consumer.recv_latest()
+                    if spectrum is not None:
+                        spectrum = np.asarray(spectrum, dtype=float)
+                if spectrum is None:
+                    _, shm_spectrum = _read_latest_sdr_core_frame()
+                    spectrum = np.asarray(shm_spectrum, dtype=float)
                 if spectrum.size == 0 or not np.isfinite(spectrum).all():
                     await asyncio.sleep(frame_delay)
                     continue
@@ -1168,8 +1307,14 @@ async def spectrum_stream_binary(websocket: WebSocket) -> None:
     try:
         while True:
             try:
-                _, spectrum = _read_latest_sdr_core_frame()
-                spectrum = np.asarray(spectrum, dtype=np.float32)
+                spectrum = None
+                if zmq_consumer is not None and zmq_consumer.enabled:
+                    spectrum = zmq_consumer.recv_latest()
+                if spectrum is None:
+                    _, shm_spectrum = _read_latest_sdr_core_frame()
+                    spectrum = np.asarray(shm_spectrum, dtype=np.float32)
+                else:
+                    spectrum = np.asarray(spectrum, dtype=np.float32)
                 if spectrum.size == 0 or not np.isfinite(spectrum).all():
                     await asyncio.sleep(frame_delay)
                     continue
