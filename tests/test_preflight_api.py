@@ -20,6 +20,8 @@ def test_preflight_endpoint_exposes_runtime_mode():
     assert data['runtime_mode'] == 'demo'
     assert data['hardware_detected'] is False
     assert data['data_bridge'] == 'zmq'
+    assert 'firmware_version' in data
+    assert 'firmware_warning' in data
 
 
 def test_health_returns_demo_payload_when_runtime_mode_is_demo():

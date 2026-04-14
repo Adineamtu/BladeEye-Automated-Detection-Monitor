@@ -38,8 +38,13 @@ function App() {
     buffer_load_percent: 0,
     zmq_throughput_bps: 0,
     dropped_frames: 0,
+    zmq_latency_ms: 0,
+    ai_last_activity_ts: null,
+    ai_jobs_processed: 0,
   });
   const [runtimeLogs, setRuntimeLogs] = useState([]);
+  const [offlineIqResult, setOfflineIqResult] = useState(null);
+  const [offlineIqError, setOfflineIqError] = useState('');
 
   useEffect(() => {
     async function fetchWatchlist() {
@@ -223,6 +228,44 @@ function App() {
     setTimeout(() => setWsBeat(false), 140);
   }
 
+  async function analyzeIqFile(file) {
+    if (!file) return;
+    setOfflineIqError('');
+    setOfflineIqResult(null);
+    try {
+      const res = await fetch(`/api/intelligence/classify-file?filename=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: await file.arrayBuffer(),
+      });
+      if (!res.ok) throw new Error('Offline IQ analysis failed');
+      setOfflineIqResult(await res.json());
+    } catch (err) {
+      setOfflineIqError('Failed to analyze IQ file');
+    }
+  }
+
+  async function downloadRuntimeLogsZip() {
+    try {
+      const res = await fetch('/api/logs/export');
+      if (!res.ok) throw new Error('Failed to export logs');
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'bladeeye_runtime_logs.zip';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  const aiActive = telemetry.ai_last_activity_ts
+    && (Date.now() / 1000 - Number(telemetry.ai_last_activity_ts)) <= 1.5;
+
   return (
     <div className="App">
       {preflight.runtime_mode === 'demo' && (
@@ -266,7 +309,7 @@ function App() {
         Data Bridge: {(preflight.data_bridge || telemetry.data_bridge || 'demo').toUpperCase()} · Buffer
         Load: {(telemetry.buffer_load_percent || 0).toFixed(1)}% · ZMQ Throughput:{' '}
         {Math.round((telemetry.zmq_throughput_bps || 0) / 1000)} kbps · Dropped Frames:{' '}
-        {telemetry.dropped_frames || 0}
+        {telemetry.dropped_frames || 0} · Latency: {(telemetry.zmq_latency_ms || 0).toFixed(2)} ms
       </div>
       <div className="ws-heartbeat">
         <span
@@ -294,6 +337,28 @@ function App() {
             onSpectrumFrame={handleSpectrumFrame}
             onSocketStateChange={setWsConnected}
           />
+          <div className="ai-activity">
+            <span className={`status-led ${aiActive ? 'connected pulse' : 'disconnected'}`} />
+            AI Activity · Jobs: {telemetry.ai_jobs_processed || 0}
+          </div>
+          {preflight.runtime_mode === 'demo' && (
+            <section className="offline-iq-panel">
+              <h3>Offline IQ Analyzer (Demo Mode)</h3>
+              <input
+                type="file"
+                accept=".iq,.complex,application/octet-stream"
+                onChange={(e) => analyzeIqFile(e.target.files?.[0])}
+              />
+              {offlineIqError && <div className="runtime-log-item">{offlineIqError}</div>}
+              {offlineIqResult && (
+                <div className="runtime-log-item">
+                  {offlineIqResult.filename} · {offlineIqResult.samples} samples ·
+                  {' '}Mod: {offlineIqResult.modulation_type} · SNR: {offlineIqResult.snr_db?.toFixed?.(2)}
+                  {' '}dB · Baud: {offlineIqResult.baud_rate ?? 'n/a'}
+                </div>
+              )}
+            </section>
+          )}
           <WatchlistPanel watchlist={watchlist} onAdd={addWatchlist} onRemove={removeWatchlist} />
           <DetectedSignalsPanel
             signals={signals}
@@ -309,7 +374,12 @@ function App() {
             config={config}
           />
           <section className="runtime-logs-panel">
-            <h3>Runtime Error Logs</h3>
+            <h3>
+              Runtime Error Logs
+              <button type="button" onClick={downloadRuntimeLogsZip} style={{ marginLeft: '0.6rem' }}>
+                Export .zip
+              </button>
+            </h3>
             {runtimeLogs.length === 0 ? (
               <div className="runtime-log-item muted">No recent runtime errors.</div>
             ) : (
