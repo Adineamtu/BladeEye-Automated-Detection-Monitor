@@ -276,6 +276,8 @@ void command_listener(RuntimeConfig& cfg) {
                 is >> value;
                 cfg.threshold_db.store(value);
             } else if (command == "START") {
+                // Hardware/startup handoff is intentionally tied to START so the
+                // core avoids touching SDR resources before explicit user intent.
                 cfg.stream_enabled.store(true);
             } else if (command == "STOP") {
                 cfg.stream_enabled.store(false);
