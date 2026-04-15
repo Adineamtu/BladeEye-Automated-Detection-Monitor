@@ -34,6 +34,23 @@ Unlike basic SDR viewers, BladeEye combines a Python intelligence engine, FastAP
 
 ---
 
+## 🧾 Integrated Devices & Protocols
+
+BladeEye now ships with a built-in RF signature catalog and protocol list.
+
+- Full device+protocol inventory: `docs/integrated_devices_and_protocols.md`
+- Runtime APIs:
+  - `GET /api/signatures` → list all built-in + user-captured signatures
+  - `POST /api/signatures/capture` → **Capture to Signature** (save unknown pulse profile as a new signature)
+
+### Capture to Signature (Auto-Învățare)
+
+When an unknown signal is detected, BladeEye displays:
+
+- `Puls detectat: <short>/<long> | Unknown Signal (...)`
+
+In the Detected Signals table you can click **Save as Signature**, enter a custom device name (for example `Barieră Garaj Vecin`), and BladeEye stores the new signature automatically in `sessions/signatures_user.json`.
+
 ## 🧱 Repository Architecture
 
 - `main.py` — application entrypoint (injects monitor, starts API server).

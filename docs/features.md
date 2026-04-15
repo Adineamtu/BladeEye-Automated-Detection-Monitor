@@ -12,3 +12,7 @@ This project can be thought of like a curious listener trying to understand the 
 - **Automatic autosave** – every few minutes the backend saves your signals, watchlist, and recordings. If the app or browser closes unexpectedly you will be prompted to restore the last session when you return.
 
 These analogies provide a high-level view of the project's capabilities without diving into technical details.
+
+
+- **Capture to Signature (Auto-Învățare)** – când apare un semnal necunoscut, aplicația afișează pulsul detectat și permite salvarea rapidă ca semnătură nouă direct din UI.
+- **Catalog integrat de device-uri/protocoale** – vezi `docs/integrated_devices_and_protocols.md` pentru lista completă a intrărilor incluse în DB.

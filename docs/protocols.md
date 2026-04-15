@@ -29,3 +29,6 @@ To add a new protocol:
 The API's `/api/signals/{frequency}/decode` endpoint automatically uses
 `identify_protocol` on decoded bitstrings and exposes the protocol name and
 fields in both the response JSON and the in-memory `Signal` object.
+
+
+For a complete inventory of integrated RF devices and protocol definitions, see `docs/integrated_devices_and_protocols.md`.
