@@ -1,12 +1,15 @@
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react';
 import { scaleSequential } from 'd3-scale';
 import { interpolateTurbo } from 'd3-scale-chromatic';
 
-const CANVAS_HEIGHT = 200; // number of rows to retain
+const CANVAS_HEIGHT = 200;
+const TARGET_FPS = 20;
+const SPECTRUM_HISTORY_ROWS = CANVAS_HEIGHT;
 
 function WaterfallPlot({
   watchlist = [],
@@ -17,7 +20,7 @@ function WaterfallPlot({
   onSocketStateChange,
 }) {
   const canvasRef = useRef(null);
-  const colorScale = scaleSequential(interpolateTurbo).domain([0, 1]);
+  const colorScale = useMemo(() => scaleSequential(interpolateTurbo).domain([0, 1]), []);
   const watchlistRef = useRef(watchlist);
   const [markers, setMarkers] = useState([]);
   const markersRef = useRef(markers);
@@ -25,6 +28,11 @@ function WaterfallPlot({
   const windowRef = useRef(freqWindow);
   const dataLenRef = useRef(512);
   const latestSpectrumRef = useRef([]);
+  const pendingSpectrumRef = useRef(null);
+  const rafRef = useRef(null);
+  const workerRef = useRef(null);
+  const spectrumHistoryRef = useRef(new Array(SPECTRUM_HISTORY_ROWS));
+  const historyIndexRef = useRef(0);
   const [cursor, setCursor] = useState(null);
 
   useEffect(() => {
@@ -100,6 +108,7 @@ function WaterfallPlot({
 
   const handleMouseMove = (e) => {
     const canvas = canvasRef.current;
+    if (!canvas) return;
     if (draggingRef.current) {
       const dx = e.clientX - lastXRef.current;
       lastXRef.current = e.clientX;
@@ -120,6 +129,7 @@ function WaterfallPlot({
 
   const handleClick = (e) => {
     const canvas = canvasRef.current;
+    if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const width = canvas.width;
@@ -130,11 +140,7 @@ function WaterfallPlot({
     const windowSize = 5;
     let peakIdx = idx;
     let peakVal = -Infinity;
-    for (
-      let i = Math.max(0, idx - windowSize);
-      i <= Math.min(data.length - 1, idx + windowSize);
-      i += 1
-    ) {
+    for (let i = Math.max(0, idx - windowSize); i <= Math.min(data.length - 1, idx + windowSize); i += 1) {
       const val = data[i];
       if (val !== undefined && val > peakVal) {
         peakVal = val;
@@ -152,11 +158,9 @@ function WaterfallPlot({
       }
     });
     if (chosen && minDiff <= windowSize) {
-      setMarkers((prev) =>
-        prev.includes(chosen.center_frequency)
-          ? prev
-          : [...prev, chosen.center_frequency],
-      );
+      setMarkers((prev) => (prev.includes(chosen.center_frequency)
+        ? prev
+        : [...prev, chosen.center_frequency]));
       if (onSelectSignal) onSelectSignal(chosen);
     }
   };
@@ -164,6 +168,7 @@ function WaterfallPlot({
   const handleContextMenu = (e) => {
     e.preventDefault();
     const canvas = canvasRef.current;
+    if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const width = canvas.width;
@@ -193,40 +198,32 @@ function WaterfallPlot({
   };
 
   const handleKeyDown = (e) => {
-    if (e.key === '+' || e.key === '=') {
-      zoom(-1);
-    } else if (e.key === '-' || e.key === '_') {
-      zoom(1);
-    } else if (e.key === 'ArrowLeft') {
-      pan(-0.1);
-    } else if (e.key === 'ArrowRight') {
-      pan(0.1);
-    }
+    if (e.key === '+' || e.key === '=') zoom(-1);
+    else if (e.key === '-' || e.key === '_') zoom(1);
+    else if (e.key === 'ArrowLeft') pan(-0.1);
+    else if (e.key === 'ArrowRight') pan(0.1);
   };
 
   useEffect(() => {
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    let ws;
-    let usingBinary = true;
-    let reconnectTimer = null;
-    let disposed = false;
-    const rowHeight = 1; // each spectrum occupies one pixel vertically
-    const handleSpectrumData = (data) => {
+    if (!ctx) return undefined;
+
+    const drawSpectrum = (data) => {
       if (onSpectrumFrame) onSpectrumFrame();
       latestSpectrumRef.current = data;
       dataLenRef.current = data.length;
+      spectrumHistoryRef.current[historyIndexRef.current] = data;
+      historyIndexRef.current = (historyIndexRef.current + 1) % SPECTRUM_HISTORY_ROWS;
+
       const width = canvas.width;
       const height = canvas.height;
+      const rowHeight = 1;
       const { start, end } = windowRef.current;
       const span = end - start;
 
-      // Scroll existing image up by one row to make room for new data
-      const imageData = ctx.getImageData(0, rowHeight, width, height - rowHeight);
-      ctx.putImageData(imageData, 0, 0);
+      ctx.drawImage(canvas, 0, rowHeight, width, height - rowHeight, 0, 0, width, height - rowHeight);
 
-      // Draw new spectrum line at the bottom
       for (let x = 0; x < width; x += 1) {
         const idx = Math.floor(start + (x / width) * span);
         const val = data[idx] ?? 0;
@@ -234,7 +231,6 @@ function WaterfallPlot({
         ctx.fillRect(x, height - rowHeight, 1, rowHeight);
       }
 
-      // Overlay watchlist markers with high-contrast lines
       watchlistRef.current.forEach((f) => {
         if (f >= start && f <= end) {
           const idx = Math.round(((f - start) / span) * width);
@@ -243,7 +239,6 @@ function WaterfallPlot({
         }
       });
 
-      // Overlay user placed markers
       markersRef.current.forEach((f) => {
         if (f >= start && f <= end) {
           const idx = Math.round(((f - start) / span) * width);
@@ -252,54 +247,41 @@ function WaterfallPlot({
         }
       });
     };
-    const scheduleReconnect = (binary) => {
-      if (disposed || reconnectTimer) return;
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        if (!disposed) connect(binary);
-      }, 1000);
-    };
 
-    const connect = (binary) => {
-      usingBinary = binary;
-      const endpoint = binary ? '/ws/spectrum/binary' : '/ws/spectrum';
-      ws = new WebSocket(`${wsProtocol}://${window.location.host}${endpoint}`);
-      if (binary) {
-        ws.binaryType = 'arraybuffer';
+    const renderLoop = () => {
+      const pending = pendingSpectrumRef.current;
+      if (pending) {
+        pendingSpectrumRef.current = null;
+        drawSpectrum(pending);
+        if (workerRef.current) {
+          workerRef.current.postMessage({ type: 'frame_processed' });
+        }
       }
-      ws.onopen = () => {
-        if (onSocketStateChange) onSocketStateChange(true);
-      };
-      ws.onclose = () => {
-        if (onSocketStateChange) onSocketStateChange(false);
-        if (binary) {
-          connect(false);
-        } else {
-          scheduleReconnect(true);
-        }
-      };
-      ws.onerror = () => {
-        if (onSocketStateChange) onSocketStateChange(false);
-      };
-      ws.onmessage = (event) => {
-        if (usingBinary && event.data instanceof ArrayBuffer) {
-          handleSpectrumData(Array.from(new Float32Array(event.data)));
-          return;
-        }
-        try {
-          handleSpectrumData(JSON.parse(event.data));
-        } catch (err) {
-          // Ignore malformed frames and keep stream alive.
-        }
-      };
+      rafRef.current = window.requestAnimationFrame(renderLoop);
     };
 
-    connect(true);
+    const apiBase = import.meta.env.VITE_API_BASE_URL || window.location.origin;
+    const worker = new Worker(new URL('./spectrumWorker.js', import.meta.url), { type: 'module' });
+    workerRef.current = worker;
+    worker.onmessage = (event) => {
+      const msg = event.data || {};
+      if (msg.type === 'socket' && onSocketStateChange) {
+        onSocketStateChange(Boolean(msg.connected));
+      }
+      if (msg.type === 'spectrum' && msg.frame) {
+        pendingSpectrumRef.current = msg.frame;
+      }
+    };
+    worker.postMessage({ type: 'init', endpointBase: apiBase, maxFps: TARGET_FPS });
+
+    rafRef.current = window.requestAnimationFrame(renderLoop);
 
     return () => {
-      disposed = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (ws) ws.close();
+      if (rafRef.current) window.cancelAnimationFrame(rafRef.current);
+      if (workerRef.current) {
+        workerRef.current.postMessage({ type: 'dispose' });
+        workerRef.current.terminate();
+      }
     };
   }, [colorScale, onSocketStateChange, onSpectrumFrame]);
 

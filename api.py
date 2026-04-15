@@ -4,7 +4,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Quer
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 from collections import deque
 from pathlib import Path
 from pydantic import BaseModel
@@ -369,10 +369,12 @@ class SigintTargetPayload(BaseModel):
     protocol_name: str | None = None
 
 
-# Optional reference to a running PassiveMonitor instance.  When present the
-# WebSocket spectrum endpoint will pull FFT slices from this monitor.  External
-# code is expected to set this variable after creating the PassiveMonitor.
+# Optional reference to a running PassiveMonitor instance.  The monitor is now
+# created lazily on START and fully released on STOP to avoid holding SDR/USB
+# resources while idle.
 monitor: Optional[object] = None
+monitor_factory: Optional[Callable[[], object]] = None
+monitor_runtime_config: dict[str, Any] = {}
 
 # Current SDR configuration.  When ``monitor`` is running these values are
 # kept in sync with the hardware via its setter methods.
@@ -1015,27 +1017,77 @@ def save_session(name: str, session: SessionPayload) -> dict:
     return {"status": "ok"}
 
 
+def _sync_monitor_from_config(m: object) -> None:
+    """Apply current API config values to a newly created monitor."""
+    if m is None:
+        return
+    center = config_state.get("center_freq")
+    if center is not None and hasattr(m, "set_center_freq"):
+        m.set_center_freq(float(center))
+    sample_rate = config_state.get("samp_rate")
+    if sample_rate is not None and hasattr(m, "set_sample_rate"):
+        m.set_sample_rate(float(sample_rate))
+    fft_size = config_state.get("fft_size")
+    if fft_size is not None and hasattr(m, "set_fft_size"):
+        m.set_fft_size(int(fft_size))
+    gain = config_state.get("gain")
+    if gain is not None and hasattr(m, "set_gain"):
+        m.set_gain(float(gain))
+    alert_threshold = config_state.get("alert_threshold")
+    if alert_threshold is not None:
+        if hasattr(m, "set_alert_threshold"):
+            m.set_alert_threshold(float(alert_threshold))
+        else:
+            setattr(m, "alert_threshold", float(alert_threshold))
+
+
+def _ensure_monitor() -> object | None:
+    """Create monitor lazily only when the user starts scanning."""
+    global monitor
+    if monitor is not None:
+        return monitor
+    if monitor_factory is None:
+        return None
+    monitor = monitor_factory()
+    _sync_monitor_from_config(monitor)
+    _bind_monitor_analysis_callback()
+    return monitor
+
+
+def _destroy_monitor() -> None:
+    """Release monitor object and best-effort close SDR resources."""
+    global monitor
+    if monitor is None:
+        return
+    if hasattr(monitor, "stop_hopping"):
+        try:
+            monitor.stop_hopping()
+        except Exception:
+            log.exception("Failed to stop hopping during monitor teardown")
+    monitor = None
+
+
 @app.post("/api/scan/start")
 def start_scan() -> dict:
     """Start or resume the SDR monitor."""
-    monitor_running = bool(monitor is not None and getattr(monitor, "is_running", False))
+    runtime_monitor = _ensure_monitor()
+    monitor_running = bool(runtime_monitor is not None and getattr(runtime_monitor, "is_running", False))
     if monitor_running:
         raise HTTPException(status_code=409, detail="Monitor already running")
     log.info("Received start scan command")
-    if monitor is not None:
-        _bind_monitor_analysis_callback()
-        if hasattr(monitor, "start"):
-            monitor.start()
-        elif hasattr(monitor, "resume"):
-            monitor.resume()
-        setattr(monitor, "is_running", True)
+    if runtime_monitor is not None:
+        if hasattr(runtime_monitor, "start"):
+            runtime_monitor.start()
+        elif hasattr(runtime_monitor, "resume"):
+            runtime_monitor.resume()
+        setattr(runtime_monitor, "is_running", True)
     _push_core_command("START")
     return {"is_running": True}
 
 
 @app.post("/api/scan/stop")
 def stop_scan() -> dict:
-    """Stop the SDR monitor."""
+    """Stop the SDR monitor and release hardware resources."""
     monitor_running = bool(monitor is not None and getattr(monitor, "is_running", False))
     if monitor is None and not os.path.exists(SDR_CORE_CMD_SOCKET):
         raise HTTPException(status_code=409, detail="Monitor not running")
@@ -1050,6 +1102,7 @@ def stop_scan() -> dict:
         elif hasattr(monitor, "halt"):
             monitor.halt()
         setattr(monitor, "is_running", False)
+    _destroy_monitor()
     _push_core_command("STOP")
     return {"is_running": False}
 
@@ -1694,7 +1747,7 @@ async def alerts_stream(websocket: WebSocket) -> None:
 
 
 @app.websocket("/ws/spectrum")
-async def spectrum_stream(websocket: WebSocket) -> None:
+async def spectrum_stream(websocket: WebSocket, fps: int = Query(20, ge=5, le=30)) -> None:
     """Stream FFT power spectra to connected clients.
 
     The endpoint sends lists of power values. If a ``PassiveMonitor`` instance
@@ -1706,7 +1759,7 @@ async def spectrum_stream(websocket: WebSocket) -> None:
     await websocket.accept()
     log.info("WebSocket spectrum client connected")
     fft_size = 1024
-    frame_delay = 0.04
+    frame_delay = 1.0 / float(fps)
     try:
         while True:
             try:
@@ -1743,12 +1796,12 @@ async def spectrum_stream(websocket: WebSocket) -> None:
 
 
 @app.websocket("/ws/spectrum/binary")
-async def spectrum_stream_binary(websocket: WebSocket) -> None:
+async def spectrum_stream_binary(websocket: WebSocket, fps: int = Query(20, ge=5, le=30)) -> None:
     """Stream FFT spectra as Float32 binary frames for lower overhead."""
     await websocket.accept()
     log.info("WebSocket binary spectrum client connected")
     fft_size = 1024
-    frame_delay = 0.04
+    frame_delay = 1.0 / float(fps)
     try:
         while True:
             try:

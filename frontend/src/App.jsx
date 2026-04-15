@@ -134,8 +134,10 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${wsProtocol}://${window.location.host}/ws/alerts`);
+    const apiBase = import.meta.env.VITE_API_BASE_URL || window.location.origin;
+    const wsProtocol = apiBase.startsWith('https') ? 'wss' : 'ws';
+    const wsHost = apiBase.replace(/^https?:\/\//, '');
+    const ws = new WebSocket(`${wsProtocol}://${wsHost}/ws/alerts`);
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
