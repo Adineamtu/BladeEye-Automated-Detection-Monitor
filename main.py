@@ -6,7 +6,7 @@ import argparse
 import uvicorn
 
 import api
-from HackRF.passive_monitor import PassiveMonitor
+from backend.passive_monitor import PassiveMonitor
 
 
 def parse_args() -> argparse.Namespace:

@@ -4,7 +4,7 @@ import time
 
 
 def test_start_hopping_cycles_watchlist():
-    from HackRF.passive_monitor import PassiveMonitor
+    from backend.passive_monitor import PassiveMonitor
 
     calls: list[float] = []
 
