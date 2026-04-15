@@ -30,6 +30,6 @@ def dummy_gnuradio_modules(monkeypatch):
     monkeypatch.setitem(sys.modules, "pmt", types.ModuleType("pmt"))
     monkeypatch.setitem(sys.modules, "osmosdr", types.ModuleType("osmosdr"))
 
-    # Ensure project root is on sys.path for ``import HackRF``
+    # Ensure project root is on sys.path for ``import backend.passive_monitor``
     import os
     monkeypatch.syspath_prepend(os.getcwd())

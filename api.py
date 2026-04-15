@@ -52,11 +52,11 @@ from backend.zmq_bridge import ZmqSpectrumConsumer
 from backend.intelligence_engine import IntelligenceEngine
 from backend.sigint_log import SigintLogStore, SigintEvent
 
-# ``Signal`` is defined in ``HackRF.passive_monitor`` which pulls in heavy
+# ``Signal`` is defined in ``backend.passive_monitor`` which pulls in heavy
 # dependencies like GNU Radio.  Import it lazily and provide a lightweight
 # fallback for environments where those libraries are unavailable (e.g. tests).
 try:  # pragma: no cover - fallback exercised in tests
-    from HackRF.passive_monitor import Signal
+    from backend.passive_monitor import Signal
 except Exception:  # pragma: no cover
     from dataclasses import dataclass
 

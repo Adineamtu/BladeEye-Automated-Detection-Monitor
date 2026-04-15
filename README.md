@@ -41,7 +41,7 @@ Unlike basic SDR viewers, BladeEye combines a Python intelligence engine, FastAP
 - `backend/` — intelligence logic (decoder, identifiers, patterns, SIGINT storage, ZMQ consumer, preflight checks).
 - `cpp/sdr_core/` — high-performance C++ SDR bridge/runtime components.
 - `frontend/` — React + Vite operational interface (waterfall, logs, watchlist, intelligence panels).
-- `HackRF/` — SDR monitoring and helper modules (with optional Cython acceleration).
+- `backend/passive_monitor.py` — SDR passive monitoring core (+ optional Cython acceleration).
 - `app_wrapper/` — standalone desktop launcher + packaging scripts.
 - `tests/` — API, intelligence, hopping/session, preflight, telemetry, and UI-adjacent backend test coverage.
 
@@ -55,7 +55,7 @@ Unlike basic SDR viewers, BladeEye combines a Python intelligence engine, FastAP
 - **Python:** 3.9+
 - **Node.js:** required for frontend build/dev.
 - **Native tooling:** `cmake`, C/C++ build tools.
-- **SDR hardware:** BladeRF (primary), HackRF, or compatible SDR paths used by your runtime setup.
+- **SDR hardware:** BladeRF (primary) or compatible SDR paths used by your runtime setup.
 
 > Note: Some advanced SDR paths require GNU Radio + osmosdr + vendor drivers.
 
@@ -93,7 +93,7 @@ cd ..
 ### 5) Optional: build Cython accelerator
 
 ```bash
-python HackRF/setup.py build_ext --inplace
+python backend/setup.py build_ext --inplace
 ```
 
 ---
