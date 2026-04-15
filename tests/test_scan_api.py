@@ -13,7 +13,8 @@ def setup_monitor():
         def stop(self):
             self.is_running = False
 
-    api.monitor = DummyMonitor()
+    api.monitor = None
+    api.monitor_factory = DummyMonitor
 
 
 def test_start_stop_scan():
@@ -30,7 +31,7 @@ def test_start_stop_scan():
 
     resp = client.post("/api/scan/stop")
     assert resp.status_code == 200
-    assert api.monitor.is_running is False
+    assert api.monitor is None
     assert resp.json()["is_running"] is False
 
     resp = client.post("/api/scan/stop")

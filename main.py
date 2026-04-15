@@ -6,7 +6,6 @@ import argparse
 import uvicorn
 
 import api
-from backend.passive_monitor import PassiveMonitor
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,22 +44,25 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Instantiate the monitor, inject it in API, and run Uvicorn."""
+    """Register lazy monitor factory and run Uvicorn."""
     args = parse_args()
 
-    hardware_monitor = PassiveMonitor(
-        center_freq=args.center_freq,
-        samp_rate=args.samp_rate,
-        bandwidth=args.samp_rate,
-        fft_size=args.fft_size,
-        rx_gain=args.gain,
-        device=args.device,
-        threshold=args.threshold,
-        detection_mode=args.detection_mode,
-    )
+    def build_monitor():
+        # Delay heavy GNU Radio/bladeRF object creation until /api/scan/start.
+        from backend.passive_monitor import PassiveMonitor
 
-    # Dependency injection: API control endpoints act on this monitor instance.
-    api.monitor = hardware_monitor
+        return PassiveMonitor(
+            center_freq=args.center_freq,
+            samp_rate=args.samp_rate,
+            bandwidth=args.samp_rate,
+            fft_size=args.fft_size,
+            rx_gain=args.gain,
+            device=args.device,
+            threshold=args.threshold,
+            detection_mode=args.detection_mode,
+        )
+
+    api.monitor_factory = build_monitor
     api.config_state.update(
         {
             "center_freq": args.center_freq,
