@@ -106,6 +106,10 @@ class Signal:
     likely_purpose: str | None = None
     label: str | None = None
     sync_word: str | None = None
+    short_pulse: float | None = None
+    long_pulse: float | None = None
+    gap: float | None = None
+    detection_status: str | None = None
 
 
 def export_signals(signals: list[Signal], path: str) -> None:

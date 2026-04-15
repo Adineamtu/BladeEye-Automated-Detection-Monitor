@@ -31,6 +31,7 @@ import matplotlib.pyplot as plt
 from weasyprint import HTML
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from backend.identifier import identify_signal
+from backend.signatures_data import match_rf_signature, capture_to_signature, all_rf_signatures
 from backend.decoder import Decoder
 from backend.patterns import save_pattern, load_patterns, find_label, PATTERN_FILE
 from backend.protocols import (
@@ -73,6 +74,10 @@ except Exception:  # pragma: no cover
         likely_purpose: str | None = None
         label: str | None = None
         sync_word: str | None = None
+        short_pulse: float | None = None
+        long_pulse: float | None = None
+        gap: float | None = None
+        detection_status: str | None = None
 
 app = FastAPI()
 app.add_middleware(
@@ -277,6 +282,20 @@ class SignalPayload(BaseModel):
     likely_purpose: str | None = None
     label: str | None = None
     sync_word: str | None = None
+    short_pulse: float | None = None
+    long_pulse: float | None = None
+    gap: float | None = None
+
+
+
+
+class CaptureToSignaturePayload(BaseModel):
+    name: str
+    short_pulse: float
+    long_pulse: float
+    gap: float | None = None
+    modulation: str | None = None
+    file_name: str | None = None
 
 
 class RecordingItem(BaseModel):
@@ -661,11 +680,34 @@ def _sync_firmware_warning_on_execution_board() -> None:
     save_execution_board(EXECUTION_BOARD_FILE, execution_board)
 
 
+def _apply_rf_signature_match(sig: Signal) -> None:
+    """Annotate signal with RF signature match from pulse timings."""
+    short_pulse = getattr(sig, "short_pulse", None)
+    long_pulse = getattr(sig, "long_pulse", None)
+    if short_pulse is None or long_pulse is None:
+        return
+
+    match = match_rf_signature(short_pulse, long_pulse, tolerance=0.10)
+    if match is not None:
+        detected_name = str(match.get("name"))
+        sig.label = detected_name
+        sig.likely_purpose = detected_name
+        sig.detection_status = f"Detected: {detected_name}"
+        return
+
+    gap = getattr(sig, "gap", None)
+    raw_params = f"short_pulse={short_pulse}, long_pulse={long_pulse}"
+    if gap is not None:
+        raw_params += f", gap={gap}"
+    sig.detection_status = f"Puls detectat: {short_pulse}/{long_pulse} | Unknown Signal ({raw_params})"
+
+
 def _remember_signals(new_signals: List[Signal]) -> None:
     """Persist latest detections in a circular in-memory buffer."""
     if new_signals:
         _mark_ai_activity()
     for sig in new_signals:
+        _apply_rf_signature_match(sig)
         if getattr(sig, "likely_purpose", None) is None:
             sig.likely_purpose = identify_signal(sig)
         _apply_auto_actions(sig)
@@ -831,6 +873,30 @@ def _prepare_report_context(name: str) -> dict:
         "waterfall": waterfall_b64,
     }
 
+
+
+@app.get("/api/signatures")
+def list_signature_catalog() -> list[dict]:
+    """Return all known RF signatures (built-in + user-captured)."""
+    return all_rf_signatures()
+
+
+@app.post("/api/signatures/capture")
+def capture_signature(payload: CaptureToSignaturePayload) -> dict:
+    """Capture unknown pulse timings as a new user signature."""
+    if not payload.name.strip():
+        raise HTTPException(status_code=422, detail="name cannot be empty")
+    item = capture_to_signature(
+        name=payload.name,
+        short_pulse=payload.short_pulse,
+        long_pulse=payload.long_pulse,
+        gap=payload.gap,
+        modulation=payload.modulation,
+        file_name=payload.file_name,
+    )
+    return {"status": "saved", "signature": item}
+
+
 @app.get("/api/signals")
 def get_signals() -> List[dict]:
     """Return currently detected signals in a JSON-friendly format."""
@@ -849,6 +915,10 @@ def get_signals() -> List[dict]:
             "likely_purpose": sig.likely_purpose,
             "label": getattr(sig, "label", None),
             "protocol": getattr(sig, "protocol", None),
+            "short_pulse": getattr(sig, "short_pulse", None),
+            "long_pulse": getattr(sig, "long_pulse", None),
+            "gap": getattr(sig, "gap", None),
+            "detection_status": getattr(sig, "detection_status", None),
         })
     return result
 
@@ -894,6 +964,7 @@ def load_session(name: str) -> dict:
         data = json.load(fh) or {}
     loaded_signals = [Signal(**item) for item in data.get("signals", [])]
     for sig in loaded_signals:
+        _apply_rf_signature_match(sig)
         if getattr(sig, "likely_purpose", None) is None:
             sig.likely_purpose = identify_signal(sig)
     signals.clear()
@@ -919,6 +990,7 @@ def save_session(name: str, session: SessionPayload) -> dict:
     sig_objs: list[Signal] = []
     for payload in session.signals:
         sig = Signal(**payload.model_dump())
+        _apply_rf_signature_match(sig)
         if getattr(sig, "likely_purpose", None) is None:
             sig.likely_purpose = identify_signal(sig)
         sig_objs.append(sig)
@@ -1092,6 +1164,7 @@ def set_session(session: SessionPayload) -> dict:
     sig_objs: list[Signal] = []
     for payload in session.signals:
         sig = _build_signal(payload)
+        _apply_rf_signature_match(sig)
         if getattr(sig, "likely_purpose", None) is None:
             sig.likely_purpose = identify_signal(sig)
         sig_objs.append(sig)
