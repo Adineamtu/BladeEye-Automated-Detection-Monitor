@@ -11,9 +11,12 @@ class DetectionEvent:
     timestamp: float
     center_freq: float
     energy: float
-    pulse_width_ms: float
-    pulse_gap_ms: float
+    signal_strength: float
+    duration_s: float
     modulation: str
+    baud_rate: float
+    purpose: str
+    protocol: str
     label: str
 
 
@@ -40,20 +43,20 @@ class SignatureClassifier:
 
     def __init__(self) -> None:
         self._signatures = [
-            {"label": "Senzor", "pw_ms": 0.35, "gap_ms": 1.1},
-            {"label": "Telecomanda", "pw_ms": 0.55, "gap_ms": 1.8},
-            {"label": "Bruiaj", "pw_ms": 2.5, "gap_ms": 0.2},
+            {"label": "Senzor", "pw_ms": 0.35, "gap_ms": 1.1, "purpose": "Telemetrie"},
+            {"label": "Telecomanda", "pw_ms": 0.55, "gap_ms": 1.8, "purpose": "Control remote"},
+            {"label": "Bruiaj", "pw_ms": 2.5, "gap_ms": 0.2, "purpose": "Posibil interferenta"},
         ]
 
-    def classify(self, pulse_width_ms: float, pulse_gap_ms: float) -> str:
-        best = ("Necunoscut", 10e9)
+    def classify(self, pulse_width_ms: float, pulse_gap_ms: float) -> tuple[str, str]:
+        best = ("Necunoscut", "Necunoscut", 10e9)
         for sig in self._signatures:
             d_pw = abs(sig["pw_ms"] - pulse_width_ms)
             d_gap = abs(sig["gap_ms"] - pulse_gap_ms)
             dist = d_pw + d_gap
-            if dist < best[1]:
-                best = (str(sig["label"]), dist)
-        return best[0]
+            if dist < best[2]:
+                best = (str(sig["label"]), str(sig["purpose"]), dist)
+        return best[0], best[1]
 
 
 class HoppingController:

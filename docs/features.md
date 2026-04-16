@@ -1,18 +1,33 @@
-# Feature Breakdown
+# BladeEye Option D - Feature Matrix
 
-This project can be thought of like a curious listener trying to understand the airwaves. Each feature mirrors an everyday activity:
+Această versiune documentează **singura variantă suportată**: Option D (desktop unificat).
 
-- **Signal identification** – like guessing what a distant sound is, the monitor tries to figure out whether a signal might be a doorbell, a weather station, or something else entirely.
-- **Recording and decoding** – similar to eavesdropping on a conversation, it captures the raw transmission and lets you view it in binary, hexadecimal, or plain text.
-- **Pattern learning** – once you know what a device sounds like, you can teach the software to recognize it automatically the next time it speaks.
-- **Community sharing** – if you discover a new pattern, you can upload it to a shared database so everyone benefits, like posting notes on a community bulletin board.
+## 1) Vizualizare în timp real
+- Waterfall painter (FFT -> colormap).
+- Spectrum overlay.
+- Zoom & pan pe axa de frecvență.
+- Theme dark desktop (QSS).
 
-## Session Safety
+## 2) Inteligență RF
+- Clasificare modulație (OOK/ASK/FSK).
+- Estimare baud rate.
+- Protocol hinting (ex: `OOK-Remote`, `FSK-Telemetry`).
+- Purpose inference pe baza semnăturilor locale.
+- Hopping manager cu interval configurabil.
 
-- **Automatic autosave** – every few minutes the backend saves your signals, watchlist, and recordings. If the app or browser closes unexpectedly you will be prompted to restore the last session when you return.
+## 3) Date și memorie
+- Circular buffer 30 secunde IQ.
+- Instant record al ultimelor 30 secunde în fișier `.iq`.
+- SQLite detection logging pentru istoric operațional.
+- Export I/Q per detecție din tabel.
 
-These analogies provide a high-level view of the project's capabilities without diving into technical details.
+## 4) Control operațional
+- Session save/load.
+- Export report HTML.
+- Export PDF.
+- Start/Stop scan.
+- Watchlist live (add/remove).
 
-
-- **Capture to Signature (Auto-Învățare)** – când apare un semnal necunoscut, aplicația afișează pulsul detectat și permite salvarea rapidă ca semnătură nouă direct din UI.
-- **Catalog integrat de device-uri/protocoale** – vezi `docs/integrated_devices_and_protocols.md` pentru lista completă a intrărilor incluse în DB.
+## 5) Offline analyzer
+- Drag & drop `.iq` / `.complex`.
+- Afișare metadate: samples, modulație, SNR, baud.
