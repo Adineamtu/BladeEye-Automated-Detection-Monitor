@@ -40,12 +40,22 @@ def parse_args() -> argparse.Namespace:
         default="ENERGY",
         help="Detection mode (FSK, ENERGY, ASK, PSK)",
     )
+    parser.add_argument(
+        "--desktop-pro",
+        action="store_true",
+        help="Launch the native BladeEye Pro desktop runtime instead of FastAPI.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     """Register lazy monitor factory and run Uvicorn."""
     args = parse_args()
+
+    if args.desktop_pro:
+        from bladeeye_pro import run_desktop_app
+
+        raise SystemExit(run_desktop_app())
 
     def build_monitor():
         # Delay heavy GNU Radio/bladeRF object creation until /api/scan/start.

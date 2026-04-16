@@ -147,6 +147,20 @@ npm run build
 # or: npm run dev
 ```
 
+### Option D — BladeEye Pro native desktop runtime
+
+Launch the new single-window desktop pipeline (hardware/acquisition + DSP + smart detection + circular buffer) directly from Python:
+
+```bash
+python main.py --desktop-pro --center-freq 868000000 --sample-rate 5000000 --gain 32
+```
+
+Notes:
+- Uses PySide6 for a native UI (no browser stack).
+- If `libbladeRF` binding is unavailable, it falls back to a high-fidelity simulated IQ source (`BLADEEYE_PRO_SIM=1`).
+- Click **Record last 30s** to dump the circular buffer into `sessions/pro_capture_<ts>.npy`.
+
+
 ---
 
 ## 🖥️ Operational Usage
