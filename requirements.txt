@@ -1,13 +1,3 @@
+PySide6
 numpy
 scipy
-matplotlib
-pytest
-Cython
-fastapi
-uvicorn
-httpx
-jinja2
-weasyprint
-requests
-
-PySide6
