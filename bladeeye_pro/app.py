@@ -145,6 +145,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._last_chunk_ts = 0.0
         self._last_latency_ms = 0.0
         self._dropped_chunks = 0
+        self._last_error_message = 'None'
 
         self._build_ui(config)
         self.acquisition.add_sink(self._on_iq_chunk)
@@ -163,8 +164,18 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.status_label.setObjectName('statusLabel')
         self.scan_status = QtWidgets.QLabel('Scan Status: Stopped')
         self.ws_status = QtWidgets.QLabel('WebSocket: N/A (Desktop mode)')
+        self.dropped_label = QtWidgets.QLabel('Dropped: 0')
+        self.error_label = QtWidgets.QLabel('Errors: None')
+        self.latency_label = QtWidgets.QLabel('Latency: 0ms')
         header = QtWidgets.QHBoxLayout()
-        for widget in (self.status_label, self.scan_status, self.ws_status):
+        for widget in (
+            self.status_label,
+            self.scan_status,
+            self.ws_status,
+            self.dropped_label,
+            self.error_label,
+            self.latency_label,
+        ):
             header.addWidget(widget)
         layout.addLayout(header)
 
@@ -317,14 +328,25 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
     def start(self) -> None:
         if self._is_scanning:
             return
-        self.acquisition.start()
+        if not self._configure_from_ui():
+            return
+        try:
+            self.acquisition.start()
+        except Exception as exc:
+            self._set_error(f'Start failed: {exc}')
+            self.scan_status.setText('Scan Status: Error')
+            return
         self._is_scanning = True
         self.scan_status.setText('Scan Status: Running')
+        self.status_label.setText('SDR Core Health: Healthy')
+        self.status_label.setStyleSheet('color: #00ff99; font-weight: 600;')
 
     def stop(self) -> None:
         self.acquisition.stop()
         self._is_scanning = False
         self.scan_status.setText('Scan Status: Stopped')
+        self.status_label.setText('SDR Core Health: Idle')
+        self.status_label.setStyleSheet('')
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         self.stop()
@@ -332,32 +354,35 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
     def _on_iq_chunk(self, chunk: np.ndarray) -> None:
-        now = time.time()
-        if self._last_chunk_ts:
-            self._last_latency_ms = (now - self._last_chunk_ts) * 1000.0
-        self._last_chunk_ts = now
+        try:
+            now = time.time()
+            if self._last_chunk_ts:
+                self._last_latency_ms = (now - self._last_chunk_ts) * 1000.0
+            self._last_chunk_ts = now
 
-        self.buffer.extend(chunk)
-        frame = self.dsp.process(chunk)
-        if self._frames.full():
-            self._dropped_chunks += 1
-            try:
-                self._frames.get_nowait()
-            except queue.Empty:
-                pass
-        self._frames.put_nowait(frame)
+            self.buffer.extend(chunk)
+            frame = self.dsp.process(chunk)
+            if self._frames.full():
+                self._dropped_chunks += 1
+                try:
+                    self._frames.get_nowait()
+                except queue.Empty:
+                    pass
+            self._frames.put_nowait(frame)
+        except Exception as exc:
+            self._set_error(f'Chunk processing failed: {exc}')
 
     def _refresh_ui(self) -> None:
         frame = None
         while not self._frames.empty():
             frame = self._frames.get_nowait()
+        self.dropped_label.setText(f'Dropped: {self._dropped_chunks}')
+        self.latency_label.setText(f'Latency: {self._last_latency_ms:.1f}ms')
+        self.error_label.setText(f'Errors: {self._last_error_message}')
+        self.status_label.setText(f'SDR Core Health: {"Healthy" if self._is_scanning else "Idle"}')
         if frame is None:
             return
         self.spectrum.update_frame(frame.averaged_fft_db)
-        self.status_label.setText(
-            f'SDR Core Health: {"Healthy" if self._is_scanning else "Idle"} | '
-            f'Latency: {self._last_latency_ms:.1f} ms | Dropped chunks: {self._dropped_chunks}'
-        )
 
         if frame.event is not None:
             self.detections.appendleft(frame.event)
@@ -504,6 +529,36 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         doc = QtGui.QTextDocument()
         doc.setHtml(self._report_html())
         doc.print(printer)
+
+    def _set_error(self, message: str) -> None:
+        self._last_error_message = message
+        self.error_label.setText(f'Errors: {message}')
+
+    def _configure_from_ui(self) -> bool:
+        try:
+            center_freq = float(self.freq_spin.value() * 1e6)
+            sample_rate = float(self.sample_slider.value() * 1e6)
+            gain = float(self.gain_slider.value())
+        except Exception as exc:
+            self._set_error(f'Invalid UI parameters: {exc}')
+            return False
+
+        self.acquisition.config.center_freq = center_freq
+        self.acquisition.config.sample_rate = sample_rate
+        self.acquisition.config.bandwidth = sample_rate
+        self.acquisition.config.gain = gain
+        self.buffer = IQCircularBuffer(capacity_samples=int(self.acquisition.config.sample_rate * 30))
+        self.dsp.sample_rate = self.acquisition.config.sample_rate
+        self.dsp.set_center_freq(center_freq)
+
+        try:
+            self.acquisition.update_params(center_freq=center_freq, bandwidth=sample_rate, gain=gain)
+        except Exception as exc:
+            self._set_error(f'Hardware configure failed: {exc}')
+            return False
+
+        self.active_freq.setText(f'Active Frequency: {center_freq:.0f} Hz')
+        return True
 
 
 def build_parser() -> argparse.ArgumentParser:
