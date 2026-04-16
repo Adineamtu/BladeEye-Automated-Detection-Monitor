@@ -159,7 +159,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
         self._apply_theme()
 
-        self.status_label = QtWidgets.QLabel('SDR Core Health: Initializing')
+        self.status_label = QtWidgets.QLabel('SDR Core Health: Idle')
         self.status_label.setObjectName('statusLabel')
         self.scan_status = QtWidgets.QLabel('Scan Status: Stopped')
         self.ws_status = QtWidgets.QLabel('WebSocket: N/A (Desktop mode)')
@@ -508,10 +508,10 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description='BladeEye Option D unified desktop runtime')
-    p.add_argument('--center-freq', type=float, default=868e6)
-    p.add_argument('--sample-rate', type=float, default=5e6)
-    p.add_argument('--bandwidth', type=float, default=5e6)
-    p.add_argument('--gain', type=float, default=32.0)
+    p.add_argument('--center-freq', type=float, default=433_920_000.0)
+    p.add_argument('--sample-rate', type=float, default=1_000_000.0)
+    p.add_argument('--bandwidth', type=float, default=1_000_000.0)
+    p.add_argument('--gain', type=float, default=20.0)
     return p
 
 
@@ -526,5 +526,4 @@ def run_desktop_app(argv: list[str] | None = None) -> int:
     )
     win = BladeEyeProWindow(cfg)
     win.show()
-    win.start()
     return app.exec()
