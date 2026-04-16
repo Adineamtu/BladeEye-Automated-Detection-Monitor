@@ -6,6 +6,7 @@ import {
 } from 'react';
 import { scaleSequential } from 'd3-scale';
 import { interpolateTurbo } from 'd3-scale-chromatic';
+import { resolveApiBaseUrl } from './network';
 
 const CANVAS_HEIGHT = 200;
 const TARGET_FPS = 20;
@@ -94,7 +95,6 @@ function WaterfallPlot({
   };
 
   const handleWheel = (e) => {
-    e.preventDefault();
     zoom(e.deltaY > 0 ? 1 : -1);
   };
 
@@ -260,7 +260,7 @@ function WaterfallPlot({
       rafRef.current = window.requestAnimationFrame(renderLoop);
     };
 
-    const apiBase = import.meta.env.VITE_API_BASE_URL || window.location.origin;
+    const apiBase = resolveApiBaseUrl();
     const worker = new Worker(new URL('./spectrumWorker.js', import.meta.url), { type: 'module' });
     workerRef.current = worker;
     worker.onmessage = (event) => {

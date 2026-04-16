@@ -251,6 +251,9 @@ class PassiveMonitor(gr.top_block):
         self.auto_squelch = True
         self.analysis_interval = 0.05
         self.dynamic_threshold_db: float | None = None
+        self.noise_floor_calibration_started_at = time.time()
+        self.noise_floor_margin_ratio = 0.12
+        self._noise_floor_window: deque[float] = deque(maxlen=64)
         self._analysis_thread: threading.Thread | None = None
         self._analysis_stop = threading.Event()
         self._analysis_callback = None
@@ -699,16 +702,23 @@ class PassiveMonitor(gr.top_block):
         detection_threshold = self.threshold
         if getattr(self, "auto_squelch", False):
             noise_floor = float(np.mean(np.maximum(spectrum, 1e-12)))
-            noise_floor_db = float(10.0 * np.log10(noise_floor))
-            self.dynamic_threshold_db = noise_floor_db + 10.0
-            detection_threshold = float(10 ** (self.dynamic_threshold_db / 10.0))
+            self._noise_floor_window.append(noise_floor)
+            window_noise_floor = float(np.mean(self._noise_floor_window))
+            calibrated = (now - self.noise_floor_calibration_started_at) >= 1.0
+            if calibrated:
+                detection_threshold = max(self.threshold, window_noise_floor * (1.0 + self.noise_floor_margin_ratio))
+            else:
+                detection_threshold = max(self.threshold, window_noise_floor * 2.0)
+            noise_floor_db = float(10.0 * np.log10(max(window_noise_floor, 1e-12)))
+            self.dynamic_threshold_db = float(10.0 * np.log10(max(detection_threshold, 1e-12)))
             self.threshold = detection_threshold
             if hasattr(self, "trigger"):
                 self.trigger.threshold = detection_threshold
             log.debug(
-                "Auto-squelch threshold set to %.2f dB over noise floor %.2f dB",
+                "Auto-squelch threshold %.2f dB (noise floor %.2f dB, calibrated=%s)",
                 self.dynamic_threshold_db,
                 noise_floor_db,
+                calibrated,
             )
 
         bin_width = self.samp_rate / self.fft_size
@@ -763,7 +773,7 @@ class PassiveMonitor(gr.top_block):
                 sig.bandwidth = bandwidth
                 sig.end_time = None
 
-            log.info(
+            log.debug(
                 "Detected peak at %.2f Hz (power=%.6f, bw=%.2f)",
                 freq,
                 power,
