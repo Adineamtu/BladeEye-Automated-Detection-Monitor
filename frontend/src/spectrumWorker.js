@@ -8,13 +8,15 @@ let frameIntervalMs = 50;
 let nextEmitAt = 0;
 let latestPending = null;
 let frameReady = true;
+let reconnectDelayMs = 1000;
 
 const scheduleReconnect = () => {
   if (disposed || reconnectTimer) return;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connect(true);
-  }, 1000);
+  }, reconnectDelayMs);
+  reconnectDelayMs = Math.min(5000, reconnectDelayMs + 500);
 };
 
 const emitFrameIfPossible = () => {
@@ -44,7 +46,10 @@ const connect = (binary) => {
   ws = new WebSocket(`${wsProtocol}://${wsHost}${endpoint}?fps=${maxFps}`);
   if (binary) ws.binaryType = 'arraybuffer';
 
-  ws.onopen = () => self.postMessage({ type: 'socket', connected: true });
+  ws.onopen = () => {
+    reconnectDelayMs = 1000;
+    self.postMessage({ type: 'socket', connected: true });
+  };
   ws.onerror = () => self.postMessage({ type: 'socket', connected: false });
   ws.onclose = () => {
     self.postMessage({ type: 'socket', connected: false });
@@ -75,6 +80,7 @@ self.onmessage = (event) => {
     maxFps = Math.max(5, Math.min(30, Number(msg.maxFps) || 20));
     frameIntervalMs = 1000 / maxFps;
     disposed = false;
+    reconnectDelayMs = 1000;
     connect(true);
     return;
   }

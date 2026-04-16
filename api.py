@@ -1760,6 +1760,7 @@ async def spectrum_stream(websocket: WebSocket, fps: int = Query(20, ge=5, le=30
     log.info("WebSocket spectrum client connected")
     fft_size = 1024
     frame_delay = 1.0 / float(fps)
+    frame_counter = 0
     try:
         while True:
             try:
@@ -1768,7 +1769,7 @@ async def spectrum_stream(websocket: WebSocket, fps: int = Query(20, ge=5, le=30
                     spectrum = zmq_consumer.recv_latest()
                     if spectrum is not None:
                         spectrum = np.asarray(spectrum, dtype=float)
-                if spectrum.size == 0 or not np.isfinite(spectrum).all():
+                if spectrum is None or spectrum.size == 0 or not np.isfinite(spectrum).all():
                     await asyncio.sleep(frame_delay)
                     continue
                 fft_size = spectrum.size
@@ -1787,11 +1788,25 @@ async def spectrum_stream(websocket: WebSocket, fps: int = Query(20, ge=5, le=30
                     fft_size = spectrum.size
                 else:
                     spectrum = np.random.random(fft_size)
+            frame_counter += 1
+            send_every = 1
+            if zmq_consumer is not None and zmq_consumer.enabled:
+                telemetry = zmq_consumer.telemetry()
+                if telemetry.get("buffer_load_percent", 0.0) >= 70.0:
+                    send_every = 4
+                elif telemetry.get("buffer_load_percent", 0.0) >= 40.0:
+                    send_every = 2
+            if frame_counter % send_every != 0:
+                await asyncio.sleep(frame_delay)
+                continue
             await websocket.send_json(np.asarray(spectrum, dtype=float).tolist())
             await asyncio.sleep(frame_delay)
     except WebSocketDisconnect:
         # Client disconnected; simply exit the loop
         log.info("WebSocket spectrum client disconnected")
+        return
+    except (BrokenPipeError, ConnectionResetError, RuntimeError):
+        log.info("WebSocket spectrum client stream closed")
         return
 
 
@@ -1802,6 +1817,7 @@ async def spectrum_stream_binary(websocket: WebSocket, fps: int = Query(20, ge=5
     log.info("WebSocket binary spectrum client connected")
     fft_size = 1024
     frame_delay = 1.0 / float(fps)
+    frame_counter = 0
     try:
         while True:
             try:
@@ -1810,7 +1826,7 @@ async def spectrum_stream_binary(websocket: WebSocket, fps: int = Query(20, ge=5
                     spectrum = zmq_consumer.recv_latest()
                 if spectrum is not None:
                     spectrum = np.asarray(spectrum, dtype=np.float32)
-                if spectrum.size == 0 or not np.isfinite(spectrum).all():
+                if spectrum is None or spectrum.size == 0 or not np.isfinite(spectrum).all():
                     await asyncio.sleep(frame_delay)
                     continue
                 fft_size = spectrum.size
@@ -1829,11 +1845,24 @@ async def spectrum_stream_binary(websocket: WebSocket, fps: int = Query(20, ge=5
                     fft_size = spectrum.size
                 else:
                     spectrum = np.random.random(fft_size).astype(np.float32)
-
+            frame_counter += 1
+            send_every = 1
+            if zmq_consumer is not None and zmq_consumer.enabled:
+                telemetry = zmq_consumer.telemetry()
+                if telemetry.get("buffer_load_percent", 0.0) >= 70.0:
+                    send_every = 4
+                elif telemetry.get("buffer_load_percent", 0.0) >= 40.0:
+                    send_every = 2
+            if frame_counter % send_every != 0:
+                await asyncio.sleep(frame_delay)
+                continue
             await websocket.send_bytes(spectrum.tobytes())
             await asyncio.sleep(frame_delay)
     except WebSocketDisconnect:
         log.info("WebSocket binary spectrum client disconnected")
+        return
+    except (BrokenPipeError, ConnectionResetError, RuntimeError):
+        log.info("WebSocket binary spectrum client stream closed")
         return
 
 

@@ -8,6 +8,7 @@ import ControlPanel from './ControlPanel';
 import PatternsPanel from './PatternsPanel';
 import ProtocolManager from './ProtocolManager';
 import LiveIntelligenceLog from './LiveIntelligenceLog';
+import { buildWebSocketUrl } from './network';
 import './App.css';
 
 function App() {
@@ -134,10 +135,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const apiBase = import.meta.env.VITE_API_BASE_URL || window.location.origin;
-    const wsProtocol = apiBase.startsWith('https') ? 'wss' : 'ws';
-    const wsHost = apiBase.replace(/^https?:\/\//, '');
-    const ws = new WebSocket(`${wsProtocol}://${wsHost}/ws/alerts`);
+    const ws = new WebSocket(buildWebSocketUrl('/ws/alerts'));
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
@@ -163,7 +161,7 @@ function App() {
       }
     }
     fetchSignals();
-    timer = setInterval(fetchSignals, 5000);
+    timer = setInterval(fetchSignals, 1000);
     return () => clearInterval(timer);
   }, []);
 
