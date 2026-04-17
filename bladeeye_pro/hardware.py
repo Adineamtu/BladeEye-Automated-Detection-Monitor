@@ -135,10 +135,15 @@ class LibBladeRFSource:
         # Keep transfer buffers smaller to reduce host-side backpressure and memory pressure.
         self._check(self._lib.bladerf_sync_config(self._dev, 0, 0, 12, 4096, 6, 2500), "bladerf_sync_config")
         self._check(self._lib.bladerf_set_frequency(self._dev, ch_rx0, int(center_freq)), "bladerf_set_frequency")
-        self._check(
-            self._lib.bladerf_set_sample_rate(self._dev, ch_rx0, int(sample_rate), ctypes.byref(actual_sr)),
-            "bladerf_set_sample_rate",
-        )
+        sample_rate_ret = self._lib.bladerf_set_sample_rate(self._dev, ch_rx0, int(sample_rate), ctypes.byref(actual_sr))
+        if sample_rate_ret != 0 and self._is_streaming:
+            # Some firmware/libbladeRF combinations require stream toggle for SR changes.
+            self._check(self._lib.bladerf_enable_module(self._dev, 0, False), "bladerf_enable_module(disable)")
+            self._is_streaming = False
+            self._check(
+                self._lib.bladerf_set_sample_rate(self._dev, ch_rx0, int(sample_rate), ctypes.byref(actual_sr)),
+                "bladerf_set_sample_rate(retry)",
+            )
         self._check(
             self._lib.bladerf_set_bandwidth(self._dev, ch_rx0, int(bandwidth), ctypes.byref(actual_bw)),
             "bladerf_set_bandwidth",
@@ -229,10 +234,19 @@ class AcquisitionEngine:
     def source_name(self) -> str:
         return self._source_name
 
-    def update_params(self, *, center_freq: float | None = None, bandwidth: float | None = None, gain: float | None = None) -> None:
+    def update_params(
+        self,
+        *,
+        center_freq: float | None = None,
+        sample_rate: float | None = None,
+        bandwidth: float | None = None,
+        gain: float | None = None,
+    ) -> None:
         with self._lock:
             if center_freq is not None:
                 self.config.center_freq = float(center_freq)
+            if sample_rate is not None:
+                self.config.sample_rate = float(sample_rate)
             if bandwidth is not None:
                 self.config.bandwidth = float(bandwidth)
             if gain is not None:
