@@ -153,6 +153,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._error_log: deque[str] = deque(maxlen=5000)
         self._raw_hex_max_chars = 64
         self._visible_detection_indices: list[int] = []
+        self._table_refresh_interval_s = 0.2
+        self._last_table_refresh_ts = 0.0
+        self._pending_detection_table_refresh = False
 
         self._build_ui(config)
         self.acquisition.add_sink(self._on_iq_chunk)
@@ -449,7 +452,13 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             self.detections.appendleft(frame.event)
             self._detection_iq_snippets.appendleft(frame.detection_iq if frame.detection_iq is not None else np.array([], dtype=np.complex64))
             self.logger.write_detection(frame.event)
-            self._render_detections()
+            self._pending_detection_table_refresh = True
+        if self._pending_detection_table_refresh:
+            now = time.time()
+            if now - self._last_table_refresh_ts >= self._table_refresh_interval_s:
+                self._render_detections()
+                self._pending_detection_table_refresh = False
+                self._last_table_refresh_ts = now
         self.hopping.tick()
 
     def _render_detections(self) -> None:

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
+from multiprocessing import shared_memory
 import os
 from pathlib import Path
 import json
 import math
+from typing import Iterable
 
 import numpy as np
 
@@ -56,6 +58,21 @@ def _analyze_sync_worker(iq: np.ndarray, signatures: list[dict], snr_guard_db: f
     )
 
 
+def _analyze_sync_worker_from_shm(
+    shm_name: str,
+    iq_count: int,
+    signatures: list[dict],
+    snr_guard_db: float,
+) -> "IntelligenceResult":
+    """Read IQ samples from shared memory and run synchronous analysis."""
+    segment = shared_memory.SharedMemory(name=shm_name)
+    try:
+        iq = np.ndarray((int(iq_count),), dtype=np.complex64, buffer=segment.buf)
+        return _analyze_sync_worker(iq, signatures, snr_guard_db)
+    finally:
+        segment.close()
+
+
 @dataclass
 class IntelligenceResult:
     """Output of intelligence inference for one I/Q snapshot."""
@@ -77,11 +94,15 @@ class IntelligenceEngine:
         self._pool = self._build_executor()
         self._signatures = self._load_signatures(signatures_path)
         self._snr_guard_db = float(snr_guard_db)
+        self._executor_mode = os.getenv("BLADEEYE_INTEL_EXECUTOR", "process").strip().lower()
+        default_workers = max(2, (os.cpu_count() or 2) - 1)
+        self._executor_workers = max(2, int(os.getenv("BLADEEYE_INTEL_WORKERS", str(default_workers))))
 
     @staticmethod
     def _build_executor() -> Executor:
-        workers = max(2, int(os.getenv("BLADEEYE_INTEL_WORKERS", "2")))
-        mode = os.getenv("BLADEEYE_INTEL_EXECUTOR", "thread").strip().lower()
+        default_workers = max(2, (os.cpu_count() or 2) - 1)
+        workers = max(2, int(os.getenv("BLADEEYE_INTEL_WORKERS", str(default_workers))))
+        mode = os.getenv("BLADEEYE_INTEL_EXECUTOR", "process").strip().lower()
         if mode == "process":
             return ProcessPoolExecutor(max_workers=workers)
         return ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bladeeye-intel")
@@ -96,11 +117,82 @@ class IntelligenceEngine:
             return []
 
     async def analyze(self, iq: np.ndarray) -> IntelligenceResult:
-        """Run CPU-heavy inference in thread-pool executor."""
+        """Run CPU-heavy inference in executor.
+
+        Process mode uses a per-call shared-memory segment so the IQ payload
+        is not serialized and copied through inter-process pipes.
+        """
+        import asyncio
+
+        iq = np.asarray(iq, dtype=np.complex64)
+        if iq.size == 0:
+            return _analyze_sync_worker(iq, self._signatures, self._snr_guard_db)
+
+        return await self._submit_one(iq)
+
+    async def analyze_many(
+        self,
+        iq_windows: Iterable[np.ndarray],
+        *,
+        max_in_flight: int | None = None,
+    ) -> list[IntelligenceResult]:
+        """Analyze multiple IQ windows concurrently (scatter-gather).
+
+        The number of concurrent submissions defaults to the executor worker
+        count. In process mode, each job uses shared-memory transfer.
+        """
+        import asyncio
+
+        windows = [np.asarray(iq, dtype=np.complex64) for iq in iq_windows]
+        if not windows:
+            return []
+
+        limit = max(1, int(max_in_flight or self._executor_workers))
+        sem = asyncio.Semaphore(limit)
+
+        async def _run_one(iq: np.ndarray) -> IntelligenceResult:
+            async with sem:
+                if iq.size == 0:
+                    return _analyze_sync_worker(iq, self._signatures, self._snr_guard_db)
+                return await self._submit_one(iq)
+
+        tasks = [_run_one(iq) for iq in windows]
+        return await asyncio.gather(*tasks)
+
+    async def _submit_one(self, iq: np.ndarray) -> IntelligenceResult:
+        """Submit one IQ window to the configured executor."""
         import asyncio
 
         loop = asyncio.get_running_loop()
+        if self._executor_mode == "process":
+            segment = shared_memory.SharedMemory(create=True, size=int(iq.nbytes))
+            try:
+                shared_iq = np.ndarray(iq.shape, dtype=np.complex64, buffer=segment.buf)
+                shared_iq[:] = iq
+                return await loop.run_in_executor(
+                    self._pool,
+                    _analyze_sync_worker_from_shm,
+                    segment.name,
+                    int(iq.size),
+                    self._signatures,
+                    self._snr_guard_db,
+                )
+            finally:
+                segment.close()
+                try:
+                    segment.unlink()
+                except FileNotFoundError:
+                    # Already unlinked by process teardown/race.
+                    pass
+
         return await loop.run_in_executor(self._pool, _analyze_sync_worker, iq, self._signatures, self._snr_guard_db)
+
+    def shutdown(self) -> None:
+        """Release executor resources (useful for tests and clean shutdown)."""
+        try:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            self._pool.shutdown(wait=False)
 
     def _analyze_sync(self, iq: np.ndarray) -> IntelligenceResult:
         return _analyze_sync_worker(iq, self._signatures, self._snr_guard_db)
