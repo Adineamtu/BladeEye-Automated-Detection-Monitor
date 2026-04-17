@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from datetime import datetime
-import html
 from pathlib import Path
 import queue
 import threading
@@ -15,6 +14,7 @@ from PySide6 import QtCore, QtGui, QtPrintSupport, QtWidgets
 from .circular_buffer import IQCircularBuffer
 from .dsp import DSPEngine
 from .engine import AcquisitionEngine, HardwareConfig
+from .reporting import build_full_intelligence_report_html, is_urban_noise_label
 from .session import ProSession, SessionStore
 from .sigint_logger import SigintLogger
 from .smart_functions import DetectionEvent, HoppingController
@@ -152,6 +152,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._last_error_message = 'None'
         self._error_log: deque[str] = deque(maxlen=5000)
         self._raw_hex_max_chars = 64
+        self._visible_detection_indices: list[int] = []
 
         self._build_ui(config)
         self.acquisition.add_sink(self._on_iq_chunk)
@@ -253,6 +254,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
         self.record_btn = QtWidgets.QPushButton('Record last 30s')
         self.record_btn.clicked.connect(self._record_buffer)
+        self.hide_noise_check = QtWidgets.QCheckBox('Hide Urban Noise')
+        self.hide_noise_check.toggled.connect(lambda _: self._render_detections())
 
         for label, widget in (
             ('Preset', self.preset_combo),
@@ -261,6 +264,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             ('Gain (dB)', self.gain_slider),
             ('Alert Threshold', self.alert_threshold),
             ('', self.hop_check),
+            ('', self.hide_noise_check),
             ('', self.record_btn),
         ):
             if label:
@@ -446,7 +450,13 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.hopping.tick()
 
     def _render_detections(self) -> None:
-        rows = list(self.detections)[:150]
+        all_rows = list(self.detections)
+        if self.hide_noise_check.isChecked():
+            self._visible_detection_indices = [idx for idx, evt in enumerate(all_rows) if not is_urban_noise_label(evt.label or "")]
+        else:
+            self._visible_detection_indices = list(range(len(all_rows)))
+        self._visible_detection_indices = self._visible_detection_indices[:150]
+        rows = [all_rows[idx] for idx in self._visible_detection_indices]
         self.table.setRowCount(len(rows))
         for r, evt in enumerate(rows):
             values = [
@@ -467,11 +477,12 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._update_signal_details_panel()
 
     def _export_detection_iq(self, idx: int) -> None:
-        if idx >= len(self.detections):
+        if idx >= len(self._visible_detection_indices):
             return
-        event = list(self.detections)[idx]
-        if idx < len(self._detection_iq_snippets):
-            iq = list(self._detection_iq_snippets)[idx]
+        source_idx = self._visible_detection_indices[idx]
+        event = list(self.detections)[source_idx]
+        if source_idx < len(self._detection_iq_snippets):
+            iq = list(self._detection_iq_snippets)[source_idx]
         else:
             iq = np.array([], dtype=np.complex64)
         if iq.size == 0:
@@ -487,22 +498,27 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._copy_detection_frequency_to_watch_input(item.row())
 
     def _copy_detection_frequency_to_watch_input(self, row: int) -> None:
-        if row < 0 or row >= len(self.detections):
+        if row < 0 or row >= len(self._visible_detection_indices):
             return
-        event = list(self.detections)[row]
+        event = list(self.detections)[self._visible_detection_indices[row]]
         self.watch_input.setText(f'{event.center_freq:.0f}')
         self.watch_input.setFocus()
         self._log('INFO', f'Copied {event.center_freq:.0f} Hz to watchlist input from row {row}.')
 
     def _send_detection_to_offline_analyzer(self, row: int) -> None:
-        if row < 0 or row >= len(self.detections):
+        if row < 0 or row >= len(self._visible_detection_indices):
             return
-        iq = list(self._detection_iq_snippets)[row] if row < len(self._detection_iq_snippets) else np.array([], dtype=np.complex64)
+        source_idx = self._visible_detection_indices[row]
+        iq = (
+            list(self._detection_iq_snippets)[source_idx]
+            if source_idx < len(self._detection_iq_snippets)
+            else np.array([], dtype=np.complex64)
+        )
         if iq.size == 0:
             self.iq_info.setText('Nu există fragment IQ disponibil pentru această detecție.')
             return
         frame = self.dsp.process(iq[: max(self.dsp.fft_size, 4096)])
-        event = list(self.detections)[row]
+        event = list(self.detections)[source_idx]
         mod = frame.event.modulation if frame.event else event.modulation
         snr = float(np.max(frame.fft_db) - np.median(frame.fft_db))
         baud = frame.event.baud_rate if frame.event else event.baud_rate
@@ -531,15 +547,18 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             self._identify_detection_as(row)
 
     def _pulse_metrics_from_detection(self, row: int) -> tuple[float, float]:
-        event = list(self.detections)[row]
+        if row < 0 or row >= len(self._visible_detection_indices):
+            return 0.001, 0.001
+        source_idx = self._visible_detection_indices[row]
+        event = list(self.detections)[source_idx]
         pulse_width_ms = max(event.duration_s * 1000.0, 0.001)
         pulse_gap_ms = (1000.0 / event.baud_rate) if event.baud_rate > 0 else pulse_width_ms
         return pulse_width_ms, pulse_gap_ms
 
     def _identify_detection_as(self, row: int) -> None:
-        if row < 0 or row >= len(self.detections):
+        if row < 0 or row >= len(self._visible_detection_indices):
             return
-        event = list(self.detections)[row]
+        event = list(self.detections)[self._visible_detection_indices[row]]
         current_name = event.label if event.label and "Unknown" not in event.label else ""
         name, ok = QtWidgets.QInputDialog.getText(
             self,
@@ -567,10 +586,10 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
     def _update_signal_details_panel(self) -> None:
         selected = self.table.currentRow()
-        if selected < 0 or selected >= len(self.detections):
+        if selected < 0 or selected >= len(self._visible_detection_indices):
             self.signal_details.setPlainText('')
             return
-        event = list(self.detections)[selected]
+        event = list(self.detections)[self._visible_detection_indices[selected]]
         details = [
             f'Time: {datetime.fromtimestamp(event.timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}',
             f'Frequency: {event.center_freq / 1e6:.6f} MHz ({event.center_freq:.0f} Hz)',
@@ -673,34 +692,11 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.watch_list.addItems([f'{f:.0f}' for f in self.watchlist])
 
     def _report_html(self) -> str:
-        rows = []
-        for evt in list(self.detections):
-            label = evt.label or "Unknown / Raw Signal"
-            safe_label = html.escape(label)
-            if safe_label.startswith("Unknown"):
-                safe_label = f"{safe_label} (User Tag: n/a)"
-            rows.append(
-                "<tr>"
-                f"<td>{datetime.fromtimestamp(evt.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}</td>"
-                f"<td>{evt.center_freq / 1e6:.6f} MHz</td>"
-                f"<td>{html.escape(evt.modulation)}</td>"
-                f"<td>{evt.baud_rate:.1f}</td>"
-                f"<td>{safe_label}</td>"
-                f"<td>{evt.signal_strength:.5f}</td>"
-                f"<td>{html.escape((evt.raw_hex or '')[:self._raw_hex_max_chars])}</td>"
-                "</tr>"
-            )
-        table_html = (
-            "<table border='1' cellspacing='0' cellpadding='4'>"
-            "<thead><tr><th>Time</th><th>Freq</th><th>Mod</th><th>Baud</th><th>Label</th><th>Signal Strength</th><th>Raw Hex</th></tr></thead>"
-            f"<tbody>{''.join(rows)}</tbody></table>"
-        )
-        return (
-            '<h1>BladeEye Full Intelligence Report</h1>'
-            f'<p>Generated: {datetime.utcnow().isoformat()}Z</p>'
-            f'<p>Detections: {len(self.detections)}</p>'
-            f'<p>Watchlist: {", ".join(f"{f:.0f}" for f in self.watchlist) or "none"}</p>'
-            f'{table_html}'
+        return build_full_intelligence_report_html(
+            detections=list(self.detections),
+            watchlist=self.watchlist,
+            raw_hex_max_chars=self._raw_hex_max_chars,
+            hide_urban_noise=self.hide_noise_check.isChecked(),
         )
 
     def _export_report(self) -> None:
