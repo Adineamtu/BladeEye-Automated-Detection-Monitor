@@ -4,7 +4,6 @@ import argparse
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-import queue
 import threading
 import time
 
@@ -13,7 +12,7 @@ from PySide6 import QtCore, QtGui, QtPrintSupport, QtWidgets
 
 from .circular_buffer import IQCircularBuffer
 from .dsp import DSPEngine
-from .engine import AcquisitionEngine, HardwareConfig
+from .engine import AcquisitionEngine, HardwareConfig, SDRWorker
 from .reporting import build_full_intelligence_report_html, is_urban_noise_label
 from .session import ProSession, SessionStore
 from .sigint_logger import SigintLogger
@@ -136,14 +135,15 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
         self.buffer = IQCircularBuffer(capacity_samples=int(config.sample_rate * 30))
         self.dsp = DSPEngine(sample_rate=config.sample_rate, center_freq=config.center_freq)
+        self._dsp_lock = threading.Lock()
         self.acquisition = AcquisitionEngine(config)
+        self.sdr_worker = SDRWorker(self._process_chunk, on_error=self._on_worker_error, max_pending_chunks=16, max_ready_frames=3)
         self.hopping = HoppingController(self._on_hop)
         self.logger = SigintLogger()
         self.session_store = SessionStore()
         self.watchlist: list[float] = []
         self.detections: deque[DetectionEvent] = deque(maxlen=500)
         self._detection_iq_snippets: deque[np.ndarray] = deque(maxlen=500)
-        self._frames: queue.Queue = queue.Queue(maxsize=3)
         self._state_lock = threading.Lock()
         self._is_scanning = False
         self._last_chunk_ts = 0.0
@@ -245,8 +245,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.alert_threshold.setRange(1.0, 1_000_000.0)
         self.alert_threshold.setDecimals(2)
         self.alert_threshold.setValue(50_000.0)
-        self.alert_threshold.valueChanged.connect(lambda v: self.dsp.set_trigger_gain(max(1.0, v / 125000.0)))
-        self.dsp.set_trigger_gain(max(1.0, self.alert_threshold.value() / 125000.0))
+        self.alert_threshold.valueChanged.connect(self._set_trigger_gain_from_threshold)
+        with self._dsp_lock:
+            self.dsp.set_trigger_gain(max(1.0, self.alert_threshold.value() / 125000.0))
 
         self.active_freq = QtWidgets.QLabel(f'Active Frequency: {config.center_freq:.0f} Hz')
         self.hop_check = QtWidgets.QCheckBox('Enable Hopping')
@@ -348,7 +349,12 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
     def _change_sample_rate(self, mhz: int) -> None:
         self.acquisition.config.sample_rate = float(mhz) * 1e6
         self.buffer = IQCircularBuffer(capacity_samples=int(self.acquisition.config.sample_rate * 30))
-        self.dsp.sample_rate = self.acquisition.config.sample_rate
+        with self._dsp_lock:
+            self.dsp.sample_rate = self.acquisition.config.sample_rate
+
+    def _set_trigger_gain_from_threshold(self, threshold: float) -> None:
+        with self._dsp_lock:
+            self.dsp.set_trigger_gain(max(1.0, float(threshold) / 125000.0))
 
     def _apply_preset(self, text: str) -> None:
         presets = {
@@ -368,8 +374,10 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         if not self._configure_from_ui():
             return
         try:
+            self.sdr_worker.start()
             self.acquisition.start()
         except Exception as exc:
+            self.sdr_worker.stop()
             self._set_error(f'Start failed: {exc}')
             self.scan_status.setText('Scan Status: Error')
             return
@@ -385,13 +393,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
     def stop(self) -> None:
         self.acquisition.stop()
+        self.sdr_worker.stop()
         self._is_scanning = False
         with self._state_lock:
-            while not self._frames.empty():
-                try:
-                    self._frames.get_nowait()
-                except queue.Empty:
-                    break
             self._last_chunk_ts = 0.0
             self._last_latency_ms = 0.0
         self.scan_status.setText('Scan Status: Stopped')
@@ -411,28 +415,27 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
                 if self._last_chunk_ts:
                     self._last_latency_ms = (now - self._last_chunk_ts) * 1000.0
                 self._last_chunk_ts = now
-
-                self.buffer.extend(chunk)
-                frame = self.dsp.process(chunk)
-                if self._frames.full():
+            self.buffer.extend(chunk)
+            if self.sdr_worker.submit_chunk(chunk):
+                with self._state_lock:
                     self._dropped_chunks += 1
-                    try:
-                        self._frames.get_nowait()
-                    except queue.Empty:
-                        pass
-                self._frames.put_nowait(frame)
         except Exception as exc:
             self._set_error(f'Chunk processing failed: {exc}')
 
     def _on_acquisition_error(self, message: str) -> None:
         self._set_error(message)
 
+    def _on_worker_error(self, message: str) -> None:
+        self._set_error(message)
+
+    def _process_chunk(self, chunk: np.ndarray):
+        with self._dsp_lock:
+            return self.dsp.process(chunk)
+
     def _refresh_ui(self) -> None:
-        frame = None
+        frame = self.sdr_worker.pop_latest_frame()
         with self._state_lock:
-            while not self._frames.empty():
-                frame = self._frames.get_nowait()
-            dropped_chunks = self._dropped_chunks
+            dropped_chunks = self._dropped_chunks + self.sdr_worker.dropped_ready_frames
             latency_ms = self._last_latency_ms
         self.dropped_label.setText(f'Dropped: {dropped_chunks}')
         self.latency_label.setText(f'Latency: {latency_ms:.1f}ms')
@@ -517,7 +520,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         if iq.size == 0:
             self.iq_info.setText('Nu există fragment IQ disponibil pentru această detecție.')
             return
-        frame = self.dsp.process(iq[: max(self.dsp.fft_size, 4096)])
+        with self._dsp_lock:
+            frame = self.dsp.process(iq[: max(self.dsp.fft_size, 4096)])
         event = list(self.detections)[source_idx]
         mod = frame.event.modulation if frame.event else event.modulation
         snr = float(np.max(frame.fft_db) - np.median(frame.fft_db))
@@ -572,12 +576,13 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         if not name:
             return
         pulse_width_ms, pulse_gap_ms = self._pulse_metrics_from_detection(row)
-        self.dsp.save_user_label(
-            name=name,
-            pulse_width_ms=pulse_width_ms,
-            pulse_gap_ms=pulse_gap_ms,
-            modulation=event.modulation,
-        )
+        with self._dsp_lock:
+            self.dsp.save_user_label(
+                name=name,
+                pulse_width_ms=pulse_width_ms,
+                pulse_gap_ms=pulse_gap_ms,
+                modulation=event.modulation,
+            )
         event.label = name
         event.purpose = "User Tagged"
         event.confidence = 1.0
@@ -607,7 +612,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
     def _retune(self, freq_hz: float) -> None:
         self.acquisition.update_params(center_freq=freq_hz)
-        self.dsp.set_center_freq(freq_hz)
+        with self._dsp_lock:
+            self.dsp.set_center_freq(freq_hz)
         self.active_freq.setText(f'Active Frequency: {freq_hz:.0f} Hz')
 
     def _record_buffer(self) -> None:
@@ -634,7 +640,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             data = np.fromfile(path, dtype=np.complex64)
             if data.size == 0:
                 raise ValueError('file empty')
-            frame = self.dsp.process(data[: max(self.dsp.fft_size, 4096)])
+            with self._dsp_lock:
+                frame = self.dsp.process(data[: max(self.dsp.fft_size, 4096)])
             mod = frame.event.modulation if frame.event else 'NOISE'
             snr = float(np.max(frame.fft_db) - np.median(frame.fft_db))
             baud = frame.event.baud_rate if frame.event else 0.0
@@ -760,8 +767,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.acquisition.config.bandwidth = sample_rate
         self.acquisition.config.gain = gain
         self.buffer = IQCircularBuffer(capacity_samples=int(self.acquisition.config.sample_rate * 30))
-        self.dsp.sample_rate = self.acquisition.config.sample_rate
-        self.dsp.set_center_freq(center_freq)
+        with self._dsp_lock:
+            self.dsp.sample_rate = self.acquisition.config.sample_rate
+            self.dsp.set_center_freq(center_freq)
 
         try:
             self.acquisition.update_params(center_freq=center_freq, bandwidth=sample_rate, gain=gain)
