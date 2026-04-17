@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ctypes
+from collections import deque
 import os
 import threading
 import time
 from ctypes.util import find_library
-from typing import Protocol
+from typing import Any, Callable, Protocol
 
 import numpy as np
 
@@ -236,13 +237,18 @@ class AcquisitionEngine:
                 self.config.bandwidth = float(bandwidth)
             if gain is not None:
                 self.config.gain = float(gain)
-            if self._source is not None:
-                self._source.configure(
-                    center_freq=self.config.center_freq,
-                    sample_rate=self.config.sample_rate,
-                    bandwidth=self.config.bandwidth,
-                    gain=self.config.gain,
-                )
+            source = self._source
+            center = self.config.center_freq
+            sample_rate = self.config.sample_rate
+            bandwidth_hz = self.config.bandwidth
+            gain_db = self.config.gain
+        if source is not None:
+            source.configure(
+                center_freq=center,
+                sample_rate=sample_rate,
+                bandwidth=bandwidth_hz,
+                gain=gain_db,
+            )
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -290,3 +296,100 @@ class AcquisitionEngine:
             self._source.close()
             self._source = None
             self._source_name = "Not initialized"
+
+
+class SDRWorker:
+    """Asynchronous DSP worker backed by bounded deques.
+
+    The worker keeps ingestion and processing decoupled:
+    acquisition pushes chunks quickly with ``submit_chunk`` and the worker thread
+    processes them in FIFO order. When queues overflow, the oldest elements are
+    evicted, keeping the runtime pinned to near real-time behavior.
+    """
+
+    def __init__(
+        self,
+        process_chunk: Callable[[np.ndarray], Any],
+        *,
+        on_error: Callable[[str], None] | None = None,
+        max_pending_chunks: int = 16,
+        max_ready_frames: int = 3,
+    ) -> None:
+        if max_pending_chunks <= 0:
+            raise ValueError("max_pending_chunks must be > 0")
+        if max_ready_frames <= 0:
+            raise ValueError("max_ready_frames must be > 0")
+        self._process_chunk = process_chunk
+        self._on_error = on_error
+        self._pending_chunks: deque[np.ndarray] = deque(maxlen=max_pending_chunks)
+        self._ready_frames: deque[Any] = deque(maxlen=max_ready_frames)
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.dropped_input_chunks = 0
+        self.dropped_ready_frames = 0
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self.dropped_input_chunks = 0
+        self.dropped_ready_frames = 0
+        self._thread = threading.Thread(target=self._run, name="bladeeye-pro-dsp", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._cv:
+            self._cv.notify_all()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        with self._lock:
+            self._pending_chunks.clear()
+            self._ready_frames.clear()
+
+    def submit_chunk(self, chunk: np.ndarray) -> bool:
+        dropped = False
+        with self._cv:
+            if len(self._pending_chunks) == self._pending_chunks.maxlen:
+                self._pending_chunks.popleft()
+                self.dropped_input_chunks += 1
+                dropped = True
+            self._pending_chunks.append(chunk)
+            self._cv.notify()
+        return dropped
+
+    def pop_latest_frame(self) -> Any | None:
+        with self._lock:
+            if not self._ready_frames:
+                return None
+            latest = self._ready_frames.pop()
+            if self._ready_frames:
+                self.dropped_ready_frames += len(self._ready_frames)
+                self._ready_frames.clear()
+            return latest
+
+    def pending_chunks(self) -> int:
+        with self._lock:
+            return len(self._pending_chunks)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            with self._cv:
+                while not self._pending_chunks and not self._stop.is_set():
+                    self._cv.wait(timeout=0.1)
+                if self._stop.is_set():
+                    break
+                chunk = self._pending_chunks.popleft()
+            try:
+                frame = self._process_chunk(chunk)
+            except Exception as exc:
+                if self._on_error is not None:
+                    self._on_error(f"DSP worker processing failed: {exc}")
+                continue
+            with self._lock:
+                if len(self._ready_frames) == self._ready_frames.maxlen:
+                    self._ready_frames.popleft()
+                    self.dropped_ready_frames += 1
+                self._ready_frames.append(frame)
