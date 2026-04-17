@@ -28,6 +28,8 @@ class SpectrumWaterfallWidget(QtWidgets.QWidget):
         self._zoom = 1.0
         self._pan = 0.0
         self._drag_start_x: int | None = None
+        self._intensity_offset = -0.12
+        self._intensity_gain = 1.05
         self.setMinimumHeight(360)
 
     def update_frame(self, spectrum_db: np.ndarray) -> None:
@@ -64,6 +66,10 @@ class SpectrumWaterfallWidget(QtWidgets.QWidget):
         start = int(np.clip(center - win // 2, 0, n - win))
         return arr[start : start + win]
 
+    def set_intensity_offset(self, offset: float) -> None:
+        self._intensity_offset = float(np.clip(offset, -0.8, 0.8))
+        self.update()
+
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802
         _ = event
         p = QtGui.QPainter(self)
@@ -78,7 +84,8 @@ class SpectrumWaterfallWidget(QtWidgets.QWidget):
                 vis = self._visible_slice(row)
                 rs = np.interp(np.linspace(0, vis.size - 1, w), np.arange(vis.size), vis)
                 for x, v in enumerate(rs):
-                    c = QtGui.QColor.fromHsvF(0.69 - 0.69 * float(v), 0.95, float(np.clip(v + 0.2, 0.0, 1.0)))
+                    val = float(np.clip((v + self._intensity_offset) * self._intensity_gain, 0.0, 1.0))
+                    c = QtGui.QColor.fromHsvF(0.69 - 0.69 * val, 0.95, val)
                     img.setPixelColor(x, y, c)
             p.drawImage(QtCore.QRect(rect.x(), rect.y(), w, h), img)
 
@@ -160,6 +167,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._lab_analyzer: PowerIndexAnalyzer | None = None
         self._recording_mode_enabled = False
         self._recording_ui_counter = 0
+        self._waterfall_suspended_for_lab = False
+        self._record_blink_on = False
 
         self._build_ui(config)
         self.acquisition.add_sink(self._on_iq_chunk)
@@ -171,6 +180,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._detections_timer = QtCore.QTimer(self)
         self._detections_timer.timeout.connect(self._flush_detection_table)
         self._detections_timer.start(self._table_refresh_interval_ms)
+        self._record_blink_timer = QtCore.QTimer(self)
+        self._record_blink_timer.timeout.connect(self._blink_record_button)
+        self._record_blink_timer.start(450)
 
     def _build_ui(self, config: HardwareConfig) -> None:
         central = QtWidgets.QWidget(self)
@@ -205,10 +217,12 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.export_report_btn.clicked.connect(self._export_report)
         self.export_pdf_btn = QtWidgets.QPushButton('Export as PDF')
         self.export_pdf_btn.clicked.connect(self._export_pdf)
-        self.start_btn = QtWidgets.QPushButton('Start')
+        self.start_btn = QtWidgets.QPushButton('START / STOP PREVIEW')
         self.start_btn.clicked.connect(self.start)
-        self.stop_btn = QtWidgets.QPushButton('Stop')
+        self.stop_btn = QtWidgets.QPushButton('STOP PREVIEW')
         self.stop_btn.clicked.connect(self.stop)
+        self.open_lab_btn = QtWidgets.QPushButton('Open LAB')
+        self.open_lab_btn.clicked.connect(self._toggle_lab_tab)
         self.error_log_btn = QtWidgets.QPushButton('Error Log')
         self.error_log_btn.clicked.connect(self._show_error_log)
         session_bar = QtWidgets.QHBoxLayout()
@@ -221,14 +235,19 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             self.export_pdf_btn,
             self.start_btn,
             self.stop_btn,
+            self.open_lab_btn,
             self.error_log_btn,
         ):
             session_bar.addWidget(w)
         session_bar.addStretch(1)
         layout.addLayout(session_bar)
 
-        self.spectrum = SpectrumWaterfallWidget(self)
-        layout.addWidget(self.spectrum, stretch=3)
+        self.tabs = QtWidgets.QTabWidget(self)
+        layout.addWidget(self.tabs, stretch=1)
+        monitor_tab = QtWidgets.QWidget(self)
+        monitor_layout = QtWidgets.QVBoxLayout(monitor_tab)
+        lab_tab = QtWidgets.QWidget(self)
+        lab_layout = QtWidgets.QVBoxLayout(lab_tab)
 
         controls = QtWidgets.QHBoxLayout()
         self.preset_combo = QtWidgets.QComboBox()
@@ -263,10 +282,15 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.hop_check = QtWidgets.QCheckBox('Enable Hopping')
         self.hop_check.toggled.connect(self._toggle_hopping)
 
-        self.record_btn = QtWidgets.QPushButton('Start Capture & Index')
+        self.record_btn = QtWidgets.QPushButton('ARM & RECORD')
         self.record_btn.clicked.connect(self._toggle_capture_recording)
+        self.record_btn.setEnabled(False)
         self.hide_noise_check = QtWidgets.QCheckBox('Hide Urban Noise')
         self.hide_noise_check.toggled.connect(lambda _: self._render_detections())
+        self.wf_intensity_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.wf_intensity_slider.setRange(-80, 80)
+        self.wf_intensity_slider.setValue(-12)
+        self.wf_intensity_slider.valueChanged.connect(self._set_waterfall_intensity)
 
         for label, widget in (
             ('Preset', self.preset_combo),
@@ -276,6 +300,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             ('Alert Threshold', self.alert_threshold),
             ('', self.hop_check),
             ('', self.hide_noise_check),
+            ('Intensity/Offset', self.wf_intensity_slider),
             ('', self.record_btn),
         ):
             if label:
@@ -283,7 +308,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             controls.addWidget(widget)
         controls.addWidget(self.active_freq)
         controls.addStretch(1)
-        layout.addLayout(controls)
+        self.spectrum = SpectrumWaterfallWidget(self)
+        monitor_layout.addWidget(self.spectrum, stretch=5)
+        monitor_layout.addLayout(controls)
 
         self.iq_drop = DropIqWidget(self)
         self.iq_drop.fileDropped.connect(self._analyze_offline_iq)
@@ -293,10 +320,10 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.encoding_compare.setReadOnly(True)
         self.encoding_compare.setMaximumHeight(170)
         self.encoding_compare.setPlaceholderText('Rezultatele Manchester/PWM/Bit inversion vor apărea aici.')
-        layout.addWidget(self.iq_drop)
-        layout.addWidget(self.iq_info)
-        layout.addWidget(self.encoding_compare_label)
-        layout.addWidget(self.encoding_compare)
+        lab_layout.addWidget(self.iq_drop)
+        lab_layout.addWidget(self.iq_info)
+        lab_layout.addWidget(self.encoding_compare_label)
+        lab_layout.addWidget(self.encoding_compare)
 
         watch_bar = QtWidgets.QHBoxLayout()
         self.watch_input = QtWidgets.QLineEdit()
@@ -309,8 +336,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         watch_bar.addWidget(self.watch_input)
         watch_bar.addWidget(self.watch_add_btn)
         watch_bar.addWidget(self.watch_remove_btn)
-        layout.addLayout(watch_bar)
-        layout.addWidget(self.watch_list)
+        monitor_layout.addLayout(watch_bar)
+        monitor_layout.addWidget(self.watch_list)
 
         detections_area = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
 
@@ -348,7 +375,12 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         details_panel.setMinimumWidth(350)
         detections_area.addWidget(details_panel)
         detections_area.setSizes([1100, 380])
-        layout.addWidget(detections_area, stretch=2)
+        lab_layout.addWidget(detections_area, stretch=2)
+
+        self.tabs.addTab(monitor_tab, 'MONITOR')
+        self.tabs.addTab(lab_tab, 'THE LAB')
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self._on_tab_changed(self.tabs.currentIndex())
 
         self.setCentralWidget(central)
 
@@ -369,6 +401,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.buffer = IQCircularBuffer(capacity_samples=int(self.acquisition.config.sample_rate * 30))
         with self._dsp_lock:
             self.dsp.sample_rate = self.acquisition.config.sample_rate
+
+    def _set_waterfall_intensity(self, value: int) -> None:
+        self.spectrum.set_intensity_offset(float(value) / 100.0)
 
     def _set_trigger_gain_from_threshold(self, threshold: float) -> None:
         with self._dsp_lock:
@@ -407,6 +442,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.scan_status.setText('Scan Status: Running')
         self.status_label.setText('SDR Core Health: Healthy')
         self.status_label.setStyleSheet('color: #00ff99; font-weight: 600;')
+        self.record_btn.setEnabled(True)
         self._log('INFO', f'Acquisition started successfully using source={self.acquisition.source_name}.')
 
     def stop(self) -> None:
@@ -421,6 +457,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.scan_status.setText('Scan Status: Stopped')
         self.status_label.setText('SDR Core Health: Idle')
         self.status_label.setStyleSheet('')
+        self.record_btn.setEnabled(False)
+        self.record_btn.setText('ARM & RECORD')
+        self.record_btn.setStyleSheet('')
         self._log('INFO', 'Acquisition stopped.')
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
@@ -439,9 +478,10 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             capture_logger = self._capture_logger
             if capture_logger is not None:
                 capture_logger.ingest(chunk)
-            should_process_dsp = (not self._recording_mode_enabled) or (self._recording_ui_counter % 12 == 0)
-            self._recording_ui_counter += 1
-            if should_process_dsp and self.sdr_worker.submit_chunk(chunk):
+                return
+            if self._waterfall_suspended_for_lab:
+                return
+            if self.sdr_worker.submit_chunk(chunk):
                 with self._state_lock:
                     self._dropped_chunks += 1
         except Exception as exc:
@@ -470,7 +510,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             gb = self._capture_logger.bytes_written / (1024 ** 3)
             self.record_btn.setText(f'Stop Capture ({gb:.2f} GB)')
         elif self._recording_mode_enabled:
-            self.record_btn.setText('Start Capture & Index')
+            self.record_btn.setText('ARM & RECORD')
+        if self._waterfall_suspended_for_lab:
+            return
         if frame is None:
             return
         self.spectrum.update_frame(frame.averaged_fft_db)
@@ -666,6 +708,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._start_capture_recording()
 
     def _start_capture_recording(self) -> None:
+        if not self._is_scanning:
+            QtWidgets.QMessageBox.information(self, 'ARM & RECORD', 'Pornește întâi MONITOR (Start).')
+            return
         out_dir = Path('sessions')
         out_dir.mkdir(exist_ok=True)
         ts = int(QtCore.QDateTime.currentSecsSinceEpoch())
@@ -678,6 +723,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         )
         self._capture_logger.start()
         self._recording_mode_enabled = True
+        self._recording_ui_counter = 0
+        self.spectrum.setStyleSheet('border: 2px solid #D71818;')
         self.record_btn.setText('Stop Capture (0.00 GB)')
         self.iq_info.setText(
             f'THE COLLECTOR active: {capture_path.name}. Live AI throttled; only lightweight waterfall updates remain.'
@@ -692,7 +739,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         index_path = logger.index_path
         self._capture_logger = None
         self._recording_mode_enabled = False
-        self.record_btn.setText('Start Capture & Index')
+        self.spectrum.setStyleSheet('')
+        self.record_btn.setText('ARM & RECORD')
+        self.record_btn.setStyleSheet('')
         self._lab_analyzer = PowerIndexAnalyzer(capture_path, index_path)
         self.iq_info.setText(
             f"THE LAB ready: index with {len(self._lab_analyzer.index.get('events', []))} events loaded from {index_path.name}."
@@ -702,6 +751,33 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             'Capture complete',
             f'Raw capture: {capture_path}\\nIndex: {index_path}',
         )
+
+    def _on_tab_changed(self, index: int) -> None:
+        lab_active = index == 1
+        self._waterfall_suspended_for_lab = lab_active
+        self.open_lab_btn.setText('Back to MONITOR' if lab_active else 'Open LAB')
+        self.start_btn.setEnabled(not lab_active)
+        self.stop_btn.setEnabled(not lab_active)
+        self.record_btn.setEnabled((not lab_active) and self._is_scanning)
+        if lab_active:
+            self.scan_status.setText('Scan Status: LAB mode (waterfall paused)')
+        elif self._is_scanning:
+            self.scan_status.setText('Scan Status: Running')
+        else:
+            self.scan_status.setText('Scan Status: Stopped')
+
+    def _blink_record_button(self) -> None:
+        if self._capture_logger is None:
+            self.record_btn.setStyleSheet('')
+            self._record_blink_on = False
+            return
+        self._record_blink_on = not self._record_blink_on
+        color = '#A90000' if self._record_blink_on else '#D71818'
+        self.record_btn.setStyleSheet(f'QPushButton {{ background-color: {color}; border: 1px solid #ff8c8c; font-weight: 700; }}')
+
+    def _toggle_lab_tab(self) -> None:
+        target = 0 if self.tabs.currentIndex() == 1 else 1
+        self.tabs.setCurrentIndex(target)
 
     def _toggle_hopping(self, enabled: bool) -> None:
         self.hopping.enabled = enabled

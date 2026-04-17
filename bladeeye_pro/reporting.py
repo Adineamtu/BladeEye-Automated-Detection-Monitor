@@ -82,6 +82,7 @@ def build_full_intelligence_report_html(
     filtered = [evt for evt in detections if not (hide_urban_noise and is_urban_noise_label(evt.label or ""))]
     groups = group_detection_events(filtered)
     rows = []
+    breakdown_blocks = []
     for group in groups:
         evt = group.head
         label = evt.label or "Unknown / Raw Signal"
@@ -98,23 +99,32 @@ def build_full_intelligence_report_html(
             f"<td>{datetime.fromtimestamp(evt.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}</td>"
             f"<td>{freq_cell}</td>"
             f"<td>{html.escape(evt.modulation)}</td>"
-            f"<td>{evt.baud_rate:.1f}</td>"
             f"<td>{safe_label}</td>"
-            f"<td>{evt.signal_strength:.5f}</td>"
-            f"<td class='raw-hex'>{html.escape((evt.raw_hex or '')[:raw_hex_max_chars])}</td>"
             "</tr>"
+        )
+        breakdown_blocks.append(
+            "<div class='signal-breakdown'>"
+            f"<h3>Signal Breakdown #{len(breakdown_blocks) + 1}</h3>"
+            f"<p><strong>Time:</strong> {datetime.fromtimestamp(evt.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}</p>"
+            f"<p><strong>Frequency:</strong> {freq_cell}</p>"
+            f"<p><strong>Modulation:</strong> {html.escape(evt.modulation)} | <strong>Baud:</strong> {evt.baud_rate:.1f}</p>"
+            f"<p><strong>Label:</strong> {safe_label} | <strong>Signal:</strong> {evt.signal_strength:.5f}</p>"
+            f"<p class='raw-hex'><strong>Raw Hex:</strong> {html.escape((evt.raw_hex or '')[:raw_hex_max_chars]) or '(not available)'}</p>"
+            "</div>"
         )
     return (
         "<html><head><meta charset='utf-8'><style>"
-        "@page { size: A4 portrait; margin: 12mm; }"
+        "@page { size: A4 landscape; margin: 10mm; }"
         "body { font-family: Arial, sans-serif; font-size: 12px; color: #111; }"
-        "h1 { margin: 0 0 8px 0; font-size: 42px; }"
+        "h1 { margin: 0 0 6px 0; font-size: 26px; }"
         "p { margin: 3px 0; }"
-        "table { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 11px; }"
+        "table { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 10px; }"
         "th, td { border: 1px solid #777; padding: 4px; vertical-align: top; }"
         "th { background: #eceff3; }"
-        "td.raw-hex { word-break: break-all; font-family: monospace; font-size: 10px; }"
+        "td.raw-hex { word-break: break-all; font-family: monospace; font-size: 9px; }"
         "tr { page-break-inside: avoid; }"
+        ".signal-breakdown { border: 1px solid #888; padding: 6px; margin: 6px 0; page-break-inside: avoid; }"
+        ".signal-breakdown h3 { margin: 0 0 4px 0; font-size: 12px; }"
         "</style></head><body>"
         "<h1>BladeEye Full Intelligence Report</h1>"
         f"<p>Generated: {datetime.now(timezone.utc).isoformat()}</p>"
@@ -122,9 +132,11 @@ def build_full_intelligence_report_html(
         f"<p>Watchlist: {', '.join(f'{f:.0f}' for f in watchlist) or 'none'}</p>"
         f"<p>Urban noise filter: {'ON' if hide_urban_noise else 'OFF'}</p>"
         "<table>"
-        "<thead><tr><th style='width:16%'>Time</th><th style='width:20%'>Freq</th><th style='width:7%'>Mod</th>"
-        "<th style='width:8%'>Baud</th><th style='width:18%'>Label</th><th style='width:9%'>Signal Strength</th>"
-        "<th style='width:22%'>Raw Hex</th></tr></thead>"
+        "<thead><tr><th style='width:24%'>Time</th><th style='width:32%'>Frequency</th><th style='width:16%'>Modulation</th>"
+        "<th style='width:28%'>Label</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody>"
-        "</table></body></html>"
+        "</table>"
+        "<h2 style='margin:10px 0 4px 0; font-size:16px;'>Signal Breakdown</h2>"
+        f"{''.join(breakdown_blocks) or '<p>No signals available.</p>'}"
+        "</body></html>"
     )
