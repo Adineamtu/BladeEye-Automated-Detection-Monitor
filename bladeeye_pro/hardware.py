@@ -5,6 +5,7 @@ import ctypes
 import os
 import threading
 import time
+from ctypes.util import find_library
 from typing import Protocol
 
 import numpy as np
@@ -52,30 +53,125 @@ class SimulatedBladeRFSource:
 
 
 class LibBladeRFSource:
-    """Thin libbladeRF loader placeholder for future native stream binding."""
+    """Minimal libbladeRF sync-RX source (SC16 Q11 -> complex64)."""
 
     def __init__(self, library_name: str = "libbladeRF.so") -> None:
+        if library_name == "libbladeRF.so":
+            library_name = find_library("bladeRF") or library_name
         self._lib = ctypes.CDLL(library_name)
+        self._dev = ctypes.c_void_p()
+        self._is_streaming = False
         self._closed = False
+        self._sample_rate = 5_000_000
+        self._open_and_init()
 
     @staticmethod
     def available(library_name: str = "libbladeRF.so") -> bool:
         try:
+            if library_name == "libbladeRF.so":
+                library_name = find_library("bladeRF") or library_name
             ctypes.CDLL(library_name)
             return True
         except OSError:
             return False
 
+    def _open_and_init(self) -> None:
+        # Function signatures
+        self._lib.bladerf_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
+        self._lib.bladerf_open.restype = ctypes.c_int
+        self._lib.bladerf_close.argtypes = [ctypes.c_void_p]
+        self._lib.bladerf_close.restype = None
+        self._lib.bladerf_strerror.argtypes = [ctypes.c_int]
+        self._lib.bladerf_strerror.restype = ctypes.c_char_p
+        self._lib.bladerf_set_sample_rate.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)]
+        self._lib.bladerf_set_sample_rate.restype = ctypes.c_int
+        self._lib.bladerf_set_frequency.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64]
+        self._lib.bladerf_set_frequency.restype = ctypes.c_int
+        self._lib.bladerf_set_bandwidth.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)]
+        self._lib.bladerf_set_bandwidth.restype = ctypes.c_int
+        self._lib.bladerf_set_gain.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        self._lib.bladerf_set_gain.restype = ctypes.c_int
+        self._lib.bladerf_sync_config.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        ]
+        self._lib.bladerf_sync_config.restype = ctypes.c_int
+        self._lib.bladerf_enable_module.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_bool]
+        self._lib.bladerf_enable_module.restype = ctypes.c_int
+        self._lib.bladerf_sync_rx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+        self._lib.bladerf_sync_rx.restype = ctypes.c_int
+
+        ret = self._lib.bladerf_open(ctypes.byref(self._dev), None)
+        if ret != 0:
+            raise RuntimeError(f"bladerf_open failed: {self._err(ret)}")
+
+        # BLADERF_RX_X1=0, BLADERF_FORMAT_SC16_Q11=0, channel RX0=0
+        self._check(self._lib.bladerf_sync_config(self._dev, 0, 0, 16, 8192, 8, 3500), "bladerf_sync_config")
+        self._check(self._lib.bladerf_enable_module(self._dev, 0, True), "bladerf_enable_module")
+        self._is_streaming = True
+
+    def _err(self, code: int) -> str:
+        try:
+            return (self._lib.bladerf_strerror(int(code)) or b"unknown").decode("utf-8", errors="replace")
+        except Exception:
+            return f"error={code}"
+
+    def _check(self, code: int, op: str) -> None:
+        if code != 0:
+            raise RuntimeError(f"{op} failed: {self._err(code)}")
+
     def configure(self, *, center_freq: float, sample_rate: float, bandwidth: float, gain: float) -> None:
-        # Minimal skeleton by design: binding full bladerf sync API is platform-specific.
-        _ = (center_freq, sample_rate, bandwidth, gain)
+        ch_rx0 = 0
+        actual_sr = ctypes.c_uint(0)
+        actual_bw = ctypes.c_uint(0)
+        self._check(self._lib.bladerf_set_frequency(self._dev, ch_rx0, int(center_freq)), "bladerf_set_frequency")
+        self._check(
+            self._lib.bladerf_set_sample_rate(self._dev, ch_rx0, int(sample_rate), ctypes.byref(actual_sr)),
+            "bladerf_set_sample_rate",
+        )
+        self._check(
+            self._lib.bladerf_set_bandwidth(self._dev, ch_rx0, int(bandwidth), ctypes.byref(actual_bw)),
+            "bladerf_set_bandwidth",
+        )
+        self._check(self._lib.bladerf_set_gain(self._dev, ch_rx0, int(gain)), "bladerf_set_gain")
+        self._sample_rate = max(1, int(actual_sr.value) or int(sample_rate))
 
     def read(self, count: int) -> np.ndarray:
-        raise NotImplementedError(
-            "libbladeRF stream read is pending platform-specific binding; use simulated source for now."
+        if self._closed:
+            raise RuntimeError("BladeRF source is closed")
+        interleaved = np.empty(int(count) * 2, dtype=np.int16)
+        ret = self._lib.bladerf_sync_rx(
+            self._dev,
+            interleaved.ctypes.data_as(ctypes.c_void_p),
+            int(count),
+            None,
+            2500,
         )
+        self._check(ret, "bladerf_sync_rx")
+        iq_i = interleaved[0::2].astype(np.float32)
+        iq_q = interleaved[1::2].astype(np.float32)
+        return ((iq_i + 1j * iq_q) / 2048.0).astype(np.complex64)
 
     def close(self) -> None:
+        if self._closed:
+            return
+        if self._is_streaming:
+            try:
+                self._lib.bladerf_enable_module(self._dev, 0, False)
+            except Exception:
+                pass
+            self._is_streaming = False
+        if self._dev:
+            try:
+                self._lib.bladerf_close(self._dev)
+            except Exception:
+                pass
+            self._dev = ctypes.c_void_p()
         self._closed = True
 
 
@@ -84,23 +180,46 @@ class AcquisitionEngine:
 
     def __init__(self, config: HardwareConfig, source: SDRSource | None = None) -> None:
         self.config = config
+        self._startup_error: str | None = None
         self._source = source or self._select_source()
+        self._source_name = self._source.__class__.__name__
         self._callbacks: list = []
+        self._error_callbacks: list = []
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
 
     def _select_source(self) -> SDRSource:
         force_sim = os.getenv("BLADEEYE_PRO_SIM", "0") == "1"
-        if not force_sim and LibBladeRFSource.available():
+        force_lib = os.getenv("BLADEEYE_PRO_USE_LIB", "0") == "1"
+        if force_sim:
+            return SimulatedBladeRFSource()
+        if LibBladeRFSource.available():
             try:
                 return LibBladeRFSource()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._startup_error = f"LibBladeRF init failed, falling back to simulated source: {exc}"
+                return SimulatedBladeRFSource()
+        if force_lib:
+            self._startup_error = "BLADEEYE_PRO_USE_LIB=1 set but libbladeRF library was not found; using simulated source."
         return SimulatedBladeRFSource()
 
     def add_sink(self, callback) -> None:
         self._callbacks.append(callback)
+
+    def add_error_sink(self, callback) -> None:
+        self._error_callbacks.append(callback)
+        startup_error = getattr(self, "_startup_error", None)
+        if startup_error:
+            callback(startup_error)
+
+    def _emit_error(self, message: str) -> None:
+        for cb in self._error_callbacks:
+            cb(message)
+
+    @property
+    def source_name(self) -> str:
+        return self._source_name
 
     def update_params(self, *, center_freq: float | None = None, bandwidth: float | None = None, gain: float | None = None) -> None:
         with self._lock:
@@ -136,9 +255,14 @@ class AcquisitionEngine:
             try:
                 chunk = self._source.read(self.config.chunk_size)
             except NotImplementedError:
+                self._emit_error(
+                    "libbladeRF read path is not implemented for the selected backend. "
+                    "Use BLADEEYE_PRO_SIM=1 or provide a complete SDRSource implementation."
+                )
                 time.sleep(0.1)
                 continue
-            except Exception:
+            except Exception as exc:
+                self._emit_error(f"Acquisition read failed: {exc}")
                 time.sleep(0.01)
                 continue
 

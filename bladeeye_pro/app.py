@@ -129,7 +129,7 @@ class DropIqWidget(QtWidgets.QFrame):
 class BladeEyeProWindow(QtWidgets.QMainWindow):
     def __init__(self, config: HardwareConfig) -> None:
         super().__init__()
-        self.setWindowTitle('BladeEye Option D - Unified Desktop')
+        self.setWindowTitle('BladeEye')
         self.resize(1500, 900)
 
         self.buffer = IQCircularBuffer(capacity_samples=int(config.sample_rate * 30))
@@ -146,9 +146,11 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._last_latency_ms = 0.0
         self._dropped_chunks = 0
         self._last_error_message = 'None'
+        self._error_log: deque[str] = deque(maxlen=5000)
 
         self._build_ui(config)
         self.acquisition.add_sink(self._on_iq_chunk)
+        self.acquisition.add_error_sink(self._on_acquisition_error)
 
         self._ui_timer = QtCore.QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
@@ -163,7 +165,6 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.status_label = QtWidgets.QLabel('SDR Core Health: Idle')
         self.status_label.setObjectName('statusLabel')
         self.scan_status = QtWidgets.QLabel('Scan Status: Stopped')
-        self.ws_status = QtWidgets.QLabel('WebSocket: N/A (Desktop mode)')
         self.dropped_label = QtWidgets.QLabel('Dropped: 0')
         self.error_label = QtWidgets.QLabel('Errors: None')
         self.latency_label = QtWidgets.QLabel('Latency: 0ms')
@@ -171,7 +172,6 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         for widget in (
             self.status_label,
             self.scan_status,
-            self.ws_status,
             self.dropped_label,
             self.error_label,
             self.latency_label,
@@ -193,6 +193,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.start_btn.clicked.connect(self.start)
         self.stop_btn = QtWidgets.QPushButton('Stop')
         self.stop_btn.clicked.connect(self.stop)
+        self.error_log_btn = QtWidgets.QPushButton('Error Log')
+        self.error_log_btn.clicked.connect(self._show_error_log)
         session_bar = QtWidgets.QHBoxLayout()
         for w in (
             QtWidgets.QLabel('Session'),
@@ -203,6 +205,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             self.export_pdf_btn,
             self.start_btn,
             self.stop_btn,
+            self.error_log_btn,
         ):
             session_bar.addWidget(w)
         session_bar.addStretch(1)
@@ -235,8 +238,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.alert_threshold = QtWidgets.QDoubleSpinBox()
         self.alert_threshold.setRange(1.0, 1_000_000.0)
         self.alert_threshold.setDecimals(2)
-        self.alert_threshold.setValue(500000.0)
+        self.alert_threshold.setValue(50_000.0)
         self.alert_threshold.valueChanged.connect(lambda v: self.dsp.set_trigger_gain(max(1.0, v / 125000.0)))
+        self.dsp.set_trigger_gain(max(1.0, self.alert_threshold.value() / 125000.0))
 
         self.active_freq = QtWidgets.QLabel(f'Active Frequency: {config.center_freq:.0f} Hz')
         self.hop_check = QtWidgets.QCheckBox('Enable Hopping')
@@ -324,9 +328,12 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         }
         if text in presets:
             self.freq_spin.setValue(presets[text] / 1e6)
+            self.alert_threshold.setValue(50_000.0)
 
     def start(self) -> None:
+        self._log('INFO', 'Start requested from UI.')
         if self._is_scanning:
+            self._log('INFO', 'Start ignored: already scanning.')
             return
         if not self._configure_from_ui():
             return
@@ -340,6 +347,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.scan_status.setText('Scan Status: Running')
         self.status_label.setText('SDR Core Health: Healthy')
         self.status_label.setStyleSheet('color: #00ff99; font-weight: 600;')
+        self._log('INFO', f'Acquisition started successfully using source={self.acquisition.source_name}.')
 
     def stop(self) -> None:
         self.acquisition.stop()
@@ -347,6 +355,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.scan_status.setText('Scan Status: Stopped')
         self.status_label.setText('SDR Core Health: Idle')
         self.status_label.setStyleSheet('')
+        self._log('INFO', 'Acquisition stopped.')
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         self.stop()
@@ -371,6 +380,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             self._frames.put_nowait(frame)
         except Exception as exc:
             self._set_error(f'Chunk processing failed: {exc}')
+
+    def _on_acquisition_error(self, message: str) -> None:
+        self._set_error(message)
 
     def _refresh_ui(self) -> None:
         frame = None
@@ -458,6 +470,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             )
         except Exception as exc:
             self.iq_info.setText(f'Offline IQ analyze failed: {exc}')
+            self._log('ERROR', f'Offline IQ analyze failed: {exc}')
 
     def _add_watch(self) -> None:
         try:
@@ -533,6 +546,31 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
     def _set_error(self, message: str) -> None:
         self._last_error_message = message
         self.error_label.setText(f'Errors: {message}')
+        self._log('ERROR', message)
+
+    def _log(self, level: str, message: str) -> None:
+        ts = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        self._error_log.appendleft(f'[{ts} UTC] {level}: {message}')
+
+    def _show_error_log(self) -> None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle('BladeEye Error Log')
+        dialog.resize(1100, 600)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        log_view = QtWidgets.QPlainTextEdit(dialog)
+        log_view.setReadOnly(True)
+        log_view.setPlainText('\n'.join(self._error_log) if self._error_log else 'No log entries yet.')
+        layout.addWidget(log_view)
+        clear_btn = QtWidgets.QPushButton('Clear Log')
+        close_btn = QtWidgets.QPushButton('Close')
+        clear_btn.clicked.connect(lambda: (self._error_log.clear(), log_view.setPlainText('No log entries yet.')))
+        close_btn.clicked.connect(dialog.accept)
+        footer = QtWidgets.QHBoxLayout()
+        footer.addWidget(clear_btn)
+        footer.addStretch(1)
+        footer.addWidget(close_btn)
+        layout.addLayout(footer)
+        dialog.exec()
 
     def _configure_from_ui(self) -> bool:
         try:
@@ -558,6 +596,10 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             return False
 
         self.active_freq.setText(f'Active Frequency: {center_freq:.0f} Hz')
+        self._log(
+            'INFO',
+            f'Configured center={center_freq:.0f}Hz sample_rate={sample_rate:.0f}Hz gain={gain:.1f}dB threshold={self.alert_threshold.value():.1f}.',
+        )
         return True
 
 
