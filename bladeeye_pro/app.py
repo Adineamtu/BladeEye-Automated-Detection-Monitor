@@ -11,6 +11,7 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtPrintSupport, QtWidgets
 
 from .circular_buffer import IQCircularBuffer
+from .capture_lab import AsyncRawCaptureLogger, PowerIndexAnalyzer
 from .dsp import DSPEngine
 from .engine import AcquisitionEngine, HardwareConfig, SDRWorker
 from .reporting import build_full_intelligence_report_html, is_urban_noise_label
@@ -155,6 +156,10 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._visible_detection_indices: list[int] = []
         self._table_refresh_interval_ms = 200
         self._pending_detection_table_refresh = False
+        self._capture_logger: AsyncRawCaptureLogger | None = None
+        self._lab_analyzer: PowerIndexAnalyzer | None = None
+        self._recording_mode_enabled = False
+        self._recording_ui_counter = 0
 
         self._build_ui(config)
         self.acquisition.add_sink(self._on_iq_chunk)
@@ -258,8 +263,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.hop_check = QtWidgets.QCheckBox('Enable Hopping')
         self.hop_check.toggled.connect(self._toggle_hopping)
 
-        self.record_btn = QtWidgets.QPushButton('Record last 30s')
-        self.record_btn.clicked.connect(self._record_buffer)
+        self.record_btn = QtWidgets.QPushButton('Start Capture & Index')
+        self.record_btn.clicked.connect(self._toggle_capture_recording)
         self.hide_noise_check = QtWidgets.QCheckBox('Hide Urban Noise')
         self.hide_noise_check.toggled.connect(lambda _: self._render_detections())
 
@@ -283,8 +288,15 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.iq_drop = DropIqWidget(self)
         self.iq_drop.fileDropped.connect(self._analyze_offline_iq)
         self.iq_info = QtWidgets.QLabel('No offline file loaded.')
+        self.encoding_compare_label = QtWidgets.QLabel('Encoding Toolbox (comparativ)')
+        self.encoding_compare = QtWidgets.QPlainTextEdit(self)
+        self.encoding_compare.setReadOnly(True)
+        self.encoding_compare.setMaximumHeight(170)
+        self.encoding_compare.setPlaceholderText('Rezultatele Manchester/PWM/Bit inversion vor apărea aici.')
         layout.addWidget(self.iq_drop)
         layout.addWidget(self.iq_info)
+        layout.addWidget(self.encoding_compare_label)
+        layout.addWidget(self.encoding_compare)
 
         watch_bar = QtWidgets.QHBoxLayout()
         self.watch_input = QtWidgets.QLineEdit()
@@ -352,7 +364,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         )
 
     def _change_sample_rate(self, mhz: int) -> None:
-        self.acquisition.config.sample_rate = float(mhz) * 1e6
+        sample_rate = float(mhz) * 1e6
+        self.acquisition.update_params(sample_rate=sample_rate, bandwidth=sample_rate)
         self.buffer = IQCircularBuffer(capacity_samples=int(self.acquisition.config.sample_rate * 30))
         with self._dsp_lock:
             self.dsp.sample_rate = self.acquisition.config.sample_rate
@@ -397,6 +410,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._log('INFO', f'Acquisition started successfully using source={self.acquisition.source_name}.')
 
     def stop(self) -> None:
+        if self._capture_logger is not None:
+            self._stop_capture_recording()
         self.acquisition.stop()
         self.sdr_worker.stop()
         self._is_scanning = False
@@ -421,7 +436,12 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
                     self._last_latency_ms = (now - self._last_chunk_ts) * 1000.0
                 self._last_chunk_ts = now
             self.buffer.extend(chunk)
-            if self.sdr_worker.submit_chunk(chunk):
+            capture_logger = self._capture_logger
+            if capture_logger is not None:
+                capture_logger.ingest(chunk)
+            should_process_dsp = (not self._recording_mode_enabled) or (self._recording_ui_counter % 12 == 0)
+            self._recording_ui_counter += 1
+            if should_process_dsp and self.sdr_worker.submit_chunk(chunk):
                 with self._state_lock:
                     self._dropped_chunks += 1
         except Exception as exc:
@@ -446,6 +466,11 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.latency_label.setText(f'Latency: {latency_ms:.1f}ms')
         self.error_label.setText(f'Errors: {self._last_error_message}')
         self.status_label.setText(f'SDR Core Health: {"Healthy" if self._is_scanning else "Idle"}')
+        if self._capture_logger is not None:
+            gb = self._capture_logger.bytes_written / (1024 ** 3)
+            self.record_btn.setText(f'Stop Capture ({gb:.2f} GB)')
+        elif self._recording_mode_enabled:
+            self.record_btn.setText('Start Capture & Index')
         if frame is None:
             return
         self.spectrum.update_frame(frame.averaged_fft_db)
@@ -634,6 +659,50 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.buffer.snapshot().astype(np.complex64).tofile(path)
         QtWidgets.QMessageBox.information(self, 'Buffer saved', f'Saved: {path}')
 
+    def _toggle_capture_recording(self) -> None:
+        if self._capture_logger is not None:
+            self._stop_capture_recording()
+            return
+        self._start_capture_recording()
+
+    def _start_capture_recording(self) -> None:
+        out_dir = Path('sessions')
+        out_dir.mkdir(exist_ok=True)
+        ts = int(QtCore.QDateTime.currentSecsSinceEpoch())
+        capture_path = out_dir / f'collector_{ts}.iq'
+        threshold = max(1.0, self.alert_threshold.value() / 125000.0)
+        self._capture_logger = AsyncRawCaptureLogger(
+            capture_path,
+            sample_rate=self.acquisition.config.sample_rate,
+            power_threshold=threshold,
+        )
+        self._capture_logger.start()
+        self._recording_mode_enabled = True
+        self.record_btn.setText('Stop Capture (0.00 GB)')
+        self.iq_info.setText(
+            f'THE COLLECTOR active: {capture_path.name}. Live AI throttled; only lightweight waterfall updates remain.'
+        )
+
+    def _stop_capture_recording(self) -> None:
+        logger = self._capture_logger
+        if logger is None:
+            return
+        logger.stop()
+        capture_path = logger.output_path
+        index_path = logger.index_path
+        self._capture_logger = None
+        self._recording_mode_enabled = False
+        self.record_btn.setText('Start Capture & Index')
+        self._lab_analyzer = PowerIndexAnalyzer(capture_path, index_path)
+        self.iq_info.setText(
+            f"THE LAB ready: index with {len(self._lab_analyzer.index.get('events', []))} events loaded from {index_path.name}."
+        )
+        QtWidgets.QMessageBox.information(
+            self,
+            'Capture complete',
+            f'Raw capture: {capture_path}\\nIndex: {index_path}',
+        )
+
     def _toggle_hopping(self, enabled: bool) -> None:
         self.hopping.enabled = enabled
         if enabled:
@@ -648,7 +717,18 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
     def _analyze_offline_iq(self, path: str) -> None:
         try:
-            data = np.fromfile(path, dtype=np.complex64)
+            if self._lab_analyzer is not None:
+                events = list(self._lab_analyzer.iter_signal_windows())
+                if events:
+                    snippets = [window for _, window in events if window.size]
+                    if snippets:
+                        data = np.concatenate(snippets)
+                    else:
+                        data = np.fromfile(path, dtype=np.complex64)
+                else:
+                    data = np.fromfile(path, dtype=np.complex64)
+            else:
+                data = np.fromfile(path, dtype=np.complex64)
             if data.size == 0:
                 raise ValueError('file empty')
             with self._dsp_lock:
@@ -656,12 +736,54 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             mod = frame.event.modulation if frame.event else 'NOISE'
             snr = float(np.max(frame.fft_db) - np.median(frame.fft_db))
             baud = frame.event.baud_rate if frame.event else 0.0
+            bitstream = self._iq_to_bitstream(data[: min(data.size, int(self.acquisition.config.sample_rate * 0.12))])
+            self._render_encoding_toolbox(bitstream)
             self.iq_info.setText(
                 f'File: {Path(path).name} | Samples: {data.size} | Modulation: {mod} | SNR: {snr:.2f} dB | Baud: {baud:.1f}'
             )
         except Exception as exc:
             self.iq_info.setText(f'Offline IQ analyze failed: {exc}')
             self._log('ERROR', f'Offline IQ analyze failed: {exc}')
+            self.encoding_compare.setPlainText('')
+
+    def _iq_to_bitstream(self, iq: np.ndarray) -> str:
+        """Convert IQ window to rough binary stream for encoding toolbox preview."""
+        if iq.size < 16:
+            return ""
+        envelope = np.abs(np.asarray(iq, dtype=np.complex64))
+        threshold = float(np.median(envelope))
+        raw = (envelope > threshold).astype(np.uint8)
+        # Downsample into symbol-ish bins so display is compact and human-readable.
+        stride = max(1, raw.size // 256)
+        bits = []
+        for i in range(0, raw.size, stride):
+            chunk = raw[i : i + stride]
+            bits.append("1" if np.mean(chunk) >= 0.5 else "0")
+        return "".join(bits)
+
+    def _render_encoding_toolbox(self, bitstream: str) -> None:
+        analyzer = self._lab_analyzer
+        if analyzer is None:
+            self.encoding_compare.setPlainText("Encoding toolbox indisponibil: pornește întâi o captură THE COLLECTOR.")
+            return
+        variants = analyzer.apply_encoding_toolbox(bitstream)
+        lines = [
+            "Raw:",
+            variants.get("raw", ""),
+            "",
+            "Bit Inversion:",
+            variants.get("bit_inversion", ""),
+            "",
+            "Manchester:",
+            variants.get("manchester", ""),
+            "",
+            "Differential Manchester:",
+            variants.get("differential_manchester", ""),
+            "",
+            "PWM:",
+            variants.get("pwm", ""),
+        ]
+        self.encoding_compare.setPlainText("\n".join(lines))
 
     def _add_watch(self) -> None:
         try:
