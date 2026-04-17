@@ -13,6 +13,8 @@ from typing import Iterable
 
 import numpy as np
 
+DEFAULT_EXECUTOR_MODE = "process"
+
 
 def _analyze_sync_worker(iq: np.ndarray, signatures: list[dict], snr_guard_db: float) -> "IntelligenceResult":
     iq = np.asarray(iq, dtype=np.complex64)
@@ -91,18 +93,20 @@ class IntelligenceEngine:
     """Best-effort asynchronous classifier for low-latency SDR UX updates."""
 
     def __init__(self, signatures_path: Path, snr_guard_db: float = 6.0) -> None:
-        self._pool = self._build_executor()
+        self._executor_mode, self._executor_workers = self._resolve_executor_settings()
+        self._pool = self._build_executor(mode=self._executor_mode, workers=self._executor_workers)
         self._signatures = self._load_signatures(signatures_path)
         self._snr_guard_db = float(snr_guard_db)
-        self._executor_mode = os.getenv("BLADEEYE_INTEL_EXECUTOR", "process").strip().lower()
-        default_workers = max(2, (os.cpu_count() or 2) - 1)
-        self._executor_workers = max(2, int(os.getenv("BLADEEYE_INTEL_WORKERS", str(default_workers))))
 
     @staticmethod
-    def _build_executor() -> Executor:
+    def _resolve_executor_settings() -> tuple[str, int]:
         default_workers = max(2, (os.cpu_count() or 2) - 1)
         workers = max(2, int(os.getenv("BLADEEYE_INTEL_WORKERS", str(default_workers))))
-        mode = os.getenv("BLADEEYE_INTEL_EXECUTOR", "process").strip().lower()
+        mode = os.getenv("BLADEEYE_INTEL_EXECUTOR", DEFAULT_EXECUTOR_MODE).strip().lower()
+        return mode, workers
+
+    @staticmethod
+    def _build_executor(*, mode: str, workers: int) -> Executor:
         if mode == "process":
             return ProcessPoolExecutor(max_workers=workers)
         return ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bladeeye-intel")
