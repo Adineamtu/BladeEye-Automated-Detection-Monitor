@@ -5,6 +5,7 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 import queue
+import threading
 import time
 
 import numpy as np
@@ -12,7 +13,7 @@ from PySide6 import QtCore, QtGui, QtPrintSupport, QtWidgets
 
 from .circular_buffer import IQCircularBuffer
 from .dsp import DSPEngine
-from .hardware import AcquisitionEngine, HardwareConfig
+from .engine import AcquisitionEngine, HardwareConfig
 from .session import ProSession, SessionStore
 from .sigint_logger import SigintLogger
 from .smart_functions import DetectionEvent, HoppingController
@@ -141,6 +142,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.watchlist: list[float] = []
         self.detections: deque[DetectionEvent] = deque(maxlen=500)
         self._frames: queue.Queue = queue.Queue(maxsize=3)
+        self._state_lock = threading.Lock()
         self._is_scanning = False
         self._last_chunk_ts = 0.0
         self._last_latency_ms = 0.0
@@ -344,6 +346,10 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             self.scan_status.setText('Scan Status: Error')
             return
         self._is_scanning = True
+        with self._state_lock:
+            self._last_chunk_ts = 0.0
+            self._last_latency_ms = 0.0
+            self._dropped_chunks = 0
         self.scan_status.setText('Scan Status: Running')
         self.status_label.setText('SDR Core Health: Healthy')
         self.status_label.setStyleSheet('color: #00ff99; font-weight: 600;')
@@ -352,6 +358,14 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
     def stop(self) -> None:
         self.acquisition.stop()
         self._is_scanning = False
+        with self._state_lock:
+            while not self._frames.empty():
+                try:
+                    self._frames.get_nowait()
+                except queue.Empty:
+                    break
+            self._last_chunk_ts = 0.0
+            self._last_latency_ms = 0.0
         self.scan_status.setText('Scan Status: Stopped')
         self.status_label.setText('SDR Core Health: Idle')
         self.status_label.setStyleSheet('')
@@ -364,20 +378,21 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
     def _on_iq_chunk(self, chunk: np.ndarray) -> None:
         try:
-            now = time.time()
-            if self._last_chunk_ts:
-                self._last_latency_ms = (now - self._last_chunk_ts) * 1000.0
-            self._last_chunk_ts = now
+            with self._state_lock:
+                now = time.time()
+                if self._last_chunk_ts:
+                    self._last_latency_ms = (now - self._last_chunk_ts) * 1000.0
+                self._last_chunk_ts = now
 
-            self.buffer.extend(chunk)
-            frame = self.dsp.process(chunk)
-            if self._frames.full():
-                self._dropped_chunks += 1
-                try:
-                    self._frames.get_nowait()
-                except queue.Empty:
-                    pass
-            self._frames.put_nowait(frame)
+                self.buffer.extend(chunk)
+                frame = self.dsp.process(chunk)
+                if self._frames.full():
+                    self._dropped_chunks += 1
+                    try:
+                        self._frames.get_nowait()
+                    except queue.Empty:
+                        pass
+                self._frames.put_nowait(frame)
         except Exception as exc:
             self._set_error(f'Chunk processing failed: {exc}')
 
@@ -386,10 +401,13 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
     def _refresh_ui(self) -> None:
         frame = None
-        while not self._frames.empty():
-            frame = self._frames.get_nowait()
-        self.dropped_label.setText(f'Dropped: {self._dropped_chunks}')
-        self.latency_label.setText(f'Latency: {self._last_latency_ms:.1f}ms')
+        with self._state_lock:
+            while not self._frames.empty():
+                frame = self._frames.get_nowait()
+            dropped_chunks = self._dropped_chunks
+            latency_ms = self._last_latency_ms
+        self.dropped_label.setText(f'Dropped: {dropped_chunks}')
+        self.latency_label.setText(f'Latency: {latency_ms:.1f}ms')
         self.error_label.setText(f'Errors: {self._last_error_message}')
         self.status_label.setText(f'SDR Core Health: {"Healthy" if self._is_scanning else "Idle"}')
         if frame is None:

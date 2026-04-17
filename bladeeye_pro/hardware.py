@@ -63,7 +63,7 @@ class LibBladeRFSource:
         self._is_streaming = False
         self._closed = False
         self._sample_rate = 5_000_000
-        self._open_and_init()
+        self._prepare_api()
 
     @staticmethod
     def available(library_name: str = "libbladeRF.so") -> bool:
@@ -75,7 +75,7 @@ class LibBladeRFSource:
         except OSError:
             return False
 
-    def _open_and_init(self) -> None:
+    def _prepare_api(self) -> None:
         # Function signatures
         self._lib.bladerf_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
         self._lib.bladerf_open.restype = ctypes.c_int
@@ -106,14 +106,14 @@ class LibBladeRFSource:
         self._lib.bladerf_sync_rx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
         self._lib.bladerf_sync_rx.restype = ctypes.c_int
 
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("BladeRF source is closed")
+        if self._dev:
+            return
         ret = self._lib.bladerf_open(ctypes.byref(self._dev), None)
         if ret != 0:
             raise RuntimeError(f"bladerf_open failed: {self._err(ret)}")
-
-        # BLADERF_RX_X1=0, BLADERF_FORMAT_SC16_Q11=0, channel RX0=0
-        self._check(self._lib.bladerf_sync_config(self._dev, 0, 0, 16, 8192, 8, 3500), "bladerf_sync_config")
-        self._check(self._lib.bladerf_enable_module(self._dev, 0, True), "bladerf_enable_module")
-        self._is_streaming = True
 
     def _err(self, code: int) -> str:
         try:
@@ -126,9 +126,13 @@ class LibBladeRFSource:
             raise RuntimeError(f"{op} failed: {self._err(code)}")
 
     def configure(self, *, center_freq: float, sample_rate: float, bandwidth: float, gain: float) -> None:
+        self._ensure_open()
         ch_rx0 = 0
         actual_sr = ctypes.c_uint(0)
         actual_bw = ctypes.c_uint(0)
+        # BLADERF_RX_X1=0, BLADERF_FORMAT_SC16_Q11=0, channel RX0=0.
+        # Keep transfer buffers smaller to reduce host-side backpressure and memory pressure.
+        self._check(self._lib.bladerf_sync_config(self._dev, 0, 0, 12, 4096, 6, 2500), "bladerf_sync_config")
         self._check(self._lib.bladerf_set_frequency(self._dev, ch_rx0, int(center_freq)), "bladerf_set_frequency")
         self._check(
             self._lib.bladerf_set_sample_rate(self._dev, ch_rx0, int(sample_rate), ctypes.byref(actual_sr)),
@@ -139,11 +143,15 @@ class LibBladeRFSource:
             "bladerf_set_bandwidth",
         )
         self._check(self._lib.bladerf_set_gain(self._dev, ch_rx0, int(gain)), "bladerf_set_gain")
+        if not self._is_streaming:
+            self._check(self._lib.bladerf_enable_module(self._dev, 0, True), "bladerf_enable_module")
+            self._is_streaming = True
         self._sample_rate = max(1, int(actual_sr.value) or int(sample_rate))
 
     def read(self, count: int) -> np.ndarray:
         if self._closed:
             raise RuntimeError("BladeRF source is closed")
+        self._ensure_open()
         interleaved = np.empty(int(count) * 2, dtype=np.int16)
         ret = self._lib.bladerf_sync_rx(
             self._dev,
@@ -153,9 +161,8 @@ class LibBladeRFSource:
             2500,
         )
         self._check(ret, "bladerf_sync_rx")
-        iq_i = interleaved[0::2].astype(np.float32)
-        iq_q = interleaved[1::2].astype(np.float32)
-        return ((iq_i + 1j * iq_q) / 2048.0).astype(np.complex64)
+        iq = interleaved.reshape(-1, 2).astype(np.float32, copy=False)
+        return (iq[:, 0] + 1j * iq[:, 1]).astype(np.complex64) / 2048.0
 
     def close(self) -> None:
         if self._closed:
@@ -181,8 +188,8 @@ class AcquisitionEngine:
     def __init__(self, config: HardwareConfig, source: SDRSource | None = None) -> None:
         self.config = config
         self._startup_error: str | None = None
-        self._source = source or self._select_source()
-        self._source_name = self._source.__class__.__name__
+        self._source: SDRSource | None = source
+        self._source_name = source.__class__.__name__ if source is not None else "Not initialized"
         self._callbacks: list = []
         self._error_callbacks: list = []
         self._thread: threading.Thread | None = None
@@ -229,17 +236,20 @@ class AcquisitionEngine:
                 self.config.bandwidth = float(bandwidth)
             if gain is not None:
                 self.config.gain = float(gain)
-            self._source.configure(
-                center_freq=self.config.center_freq,
-                sample_rate=self.config.sample_rate,
-                bandwidth=self.config.bandwidth,
-                gain=self.config.gain,
-            )
+            if self._source is not None:
+                self._source.configure(
+                    center_freq=self.config.center_freq,
+                    sample_rate=self.config.sample_rate,
+                    bandwidth=self.config.bandwidth,
+                    gain=self.config.gain,
+                )
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._source = self._source or self._select_source()
+        self._source_name = self._source.__class__.__name__
         self._source.configure(
             center_freq=self.config.center_freq,
             sample_rate=self.config.sample_rate,
@@ -253,6 +263,8 @@ class AcquisitionEngine:
         sleep_s = max(0.001, self.config.chunk_size / self.config.sample_rate)
         while not self._stop.is_set():
             try:
+                if self._source is None:
+                    raise RuntimeError("Acquisition source is not initialized")
                 chunk = self._source.read(self.config.chunk_size)
             except NotImplementedError:
                 self._emit_error(
@@ -274,4 +286,7 @@ class AcquisitionEngine:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=1.0)
-        self._source.close()
+        if self._source is not None:
+            self._source.close()
+            self._source = None
+            self._source_name = "Not initialized"
