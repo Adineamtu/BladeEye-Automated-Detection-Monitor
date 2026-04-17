@@ -153,8 +153,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._error_log: deque[str] = deque(maxlen=5000)
         self._raw_hex_max_chars = 64
         self._visible_detection_indices: list[int] = []
-        self._table_refresh_interval_s = 0.2
-        self._last_table_refresh_ts = 0.0
+        self._table_refresh_interval_ms = 200
         self._pending_detection_table_refresh = False
 
         self._build_ui(config)
@@ -164,6 +163,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._ui_timer = QtCore.QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
         self._ui_timer.start(16)
+        self._detections_timer = QtCore.QTimer(self)
+        self._detections_timer.timeout.connect(self._flush_detection_table)
+        self._detections_timer.start(self._table_refresh_interval_ms)
 
     def _build_ui(self, config: HardwareConfig) -> None:
         central = QtWidgets.QWidget(self)
@@ -453,13 +455,13 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             self._detection_iq_snippets.appendleft(frame.detection_iq if frame.detection_iq is not None else np.array([], dtype=np.complex64))
             self.logger.write_detection(frame.event)
             self._pending_detection_table_refresh = True
-        if self._pending_detection_table_refresh:
-            now = time.time()
-            if now - self._last_table_refresh_ts >= self._table_refresh_interval_s:
-                self._render_detections()
-                self._pending_detection_table_refresh = False
-                self._last_table_refresh_ts = now
         self.hopping.tick()
+
+    def _flush_detection_table(self) -> None:
+        if not self._pending_detection_table_refresh:
+            return
+        self._render_detections()
+        self._pending_detection_table_refresh = False
 
     def _render_detections(self) -> None:
         all_rows = list(self.detections)

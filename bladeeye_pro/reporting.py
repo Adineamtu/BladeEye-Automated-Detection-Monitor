@@ -14,6 +14,7 @@ URBAN_NOISE_HINTS = (
     "tpms",
     "tire pressure",
 )
+DEFAULT_FHSS_CORRELATION_WINDOW_MS = 250.0
 
 
 def is_urban_noise_label(label: str) -> bool:
@@ -49,7 +50,9 @@ def _same_signal_signature(a: DetectionEvent, b: DetectionEvent) -> bool:
     return abs(a.baud_rate - b.baud_rate) <= a_baud * 0.20
 
 
-def group_detection_events(events: list[DetectionEvent], correlation_window_ms: float = 250.0) -> list[ReportEventGroup]:
+def group_detection_events(
+    events: list[DetectionEvent], correlation_window_ms: float = DEFAULT_FHSS_CORRELATION_WINDOW_MS
+) -> list[ReportEventGroup]:
     groups: list[ReportEventGroup] = []
     window_s = max(0.01, correlation_window_ms / 1000.0)
     for event in events:
