@@ -14,6 +14,7 @@ class DSPFrame:
     energy: float
     threshold: float
     event: DetectionEvent | None
+    detection_iq: np.ndarray | None = None
 
 
 class DSPEngine:
@@ -75,6 +76,7 @@ class DSPEngine:
         threshold = self._noise_floor * self._trigger_gain
 
         event = None
+        detection_iq = None
         if energy > threshold:
             amp = np.abs(iq)
             active = amp > (np.mean(amp) + 0.8 * np.std(amp))
@@ -86,10 +88,17 @@ class DSPEngine:
 
             mod = ModulationDetector.detect(iq)
             pulse_gap_ms = float(np.mean(np.diff(starts)) / self.sample_rate * 1000.0) if starts.size > 1 else 0.0
-            label, purpose = self._classifier.classify(pulse_width_ms, pulse_gap_ms)
+            label, purpose = self._classifier.classify(pulse_width_ms, pulse_gap_ms, mod)
             baud_rate = self._estimate_baud_rate(starts, self.sample_rate)
             protocol = self._protocol_from_modulation(mod, baud_rate)
             duration_s = max(pulse_width_ms / 1000.0, 1.0 / self.sample_rate)
+            snippet_samples = min(iq.size, max(2048, int(self.sample_rate * 0.006)))
+            if starts.size:
+                anchor = int(starts[0])
+            else:
+                anchor = int(iq.size * 0.5)
+            begin = int(np.clip(anchor - snippet_samples // 2, 0, max(0, iq.size - snippet_samples)))
+            detection_iq = iq[begin : begin + snippet_samples].copy()
             event = DetectionEvent(
                 timestamp=__import__("time").time(),
                 center_freq=self.center_freq,
@@ -109,4 +118,5 @@ class DSPEngine:
             energy=energy,
             threshold=threshold,
             event=event,
+            detection_iq=detection_iq,
         )

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import time
 
 import numpy as np
+from backend.signatures_data import all_rf_signatures
 
 
 @dataclass
@@ -42,20 +43,43 @@ class SignatureClassifier:
     """Pulse-width/gap classifier backed by a local signature table."""
 
     def __init__(self) -> None:
-        self._signatures = [
-            {"label": "Senzor", "pw_ms": 0.35, "gap_ms": 1.1, "purpose": "Telemetrie"},
-            {"label": "Telecomanda", "pw_ms": 0.55, "gap_ms": 1.8, "purpose": "Control remote"},
-            {"label": "Bruiaj", "pw_ms": 2.5, "gap_ms": 0.2, "purpose": "Posibil interferenta"},
-        ]
+        self._signatures = all_rf_signatures()
 
-    def classify(self, pulse_width_ms: float, pulse_gap_ms: float) -> tuple[str, str]:
-        best = ("Necunoscut", "Necunoscut", 10e9)
+    @staticmethod
+    def _normalize_modulation(modulation: str) -> str:
+        normalized = modulation.upper().replace("-", "/")
+        if normalized in {"ASK/OOK", "OOK/ASK"}:
+            return "OOK/ASK"
+        if "FSK" in normalized:
+            return "FSK"
+        return normalized
+
+    @staticmethod
+    def _purpose_from_modulation(modulation: str) -> str:
+        if modulation == "FSK":
+            return "Telemetrie"
+        if modulation == "OOK/ASK":
+            return "Control remote"
+        return "Necunoscut"
+
+    def classify(self, pulse_width_ms: float, pulse_gap_ms: float, modulation: str) -> tuple[str, str]:
+        modulation = self._normalize_modulation(modulation)
+        best = ("Necunoscut", self._purpose_from_modulation(modulation), 10e9)
+        pulse_width_us = pulse_width_ms * 1000.0
+        pulse_gap_us = pulse_gap_ms * 1000.0
         for sig in self._signatures:
-            d_pw = abs(sig["pw_ms"] - pulse_width_ms)
-            d_gap = abs(sig["gap_ms"] - pulse_gap_ms)
+            sig_mod = self._normalize_modulation(str(sig.get("modulation", "")))
+            if sig_mod and modulation and sig_mod != modulation:
+                continue
+            short_pulse = float(sig.get("short_pulse") or 0.0)
+            long_pulse = float(sig.get("long_pulse") or short_pulse)
+            gap = float(sig.get("gap") or 0.0)
+            sig_pulse = short_pulse if pulse_width_us <= (short_pulse + long_pulse) / 2.0 else long_pulse
+            d_pw = abs(sig_pulse - pulse_width_us)
+            d_gap = abs(gap - pulse_gap_us)
             dist = d_pw + d_gap
             if dist < best[2]:
-                best = (str(sig["label"]), str(sig["purpose"]), dist)
+                best = (str(sig.get("name", "Necunoscut")), self._purpose_from_modulation(modulation), dist)
         return best[0], best[1]
 
 

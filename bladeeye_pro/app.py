@@ -141,6 +141,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.session_store = SessionStore()
         self.watchlist: list[float] = []
         self.detections: deque[DetectionEvent] = deque(maxlen=500)
+        self._detection_iq_snippets: deque[np.ndarray] = deque(maxlen=500)
         self._frames: queue.Queue = queue.Queue(maxsize=3)
         self._state_lock = threading.Lock()
         self._is_scanning = False
@@ -288,6 +289,12 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.watch_list)
 
         self.table = QtWidgets.QTableWidget(0, 9)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.itemDoubleClicked.connect(self._on_detection_double_clicked)
+        self.table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_detection_context_menu)
         self.table.setHorizontalHeaderLabels(
             [
                 'Center Frequency',
@@ -416,6 +423,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
         if frame.event is not None:
             self.detections.appendleft(frame.event)
+            self._detection_iq_snippets.appendleft(frame.detection_iq if frame.detection_iq is not None else np.array([], dtype=np.complex64))
             self.logger.write_detection(frame.event)
             self._render_detections()
         self.hopping.tick()
@@ -444,11 +452,62 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         if idx >= len(self.detections):
             return
         event = list(self.detections)[idx]
-        iq = self.buffer.latest(int(max(2048, event.duration_s * self.acquisition.config.sample_rate)))
-        out_dir = Path('sessions')
+        if idx < len(self._detection_iq_snippets):
+            iq = list(self._detection_iq_snippets)[idx]
+        else:
+            iq = np.array([], dtype=np.complex64)
+        if iq.size == 0:
+            iq = self.buffer.latest(int(max(2048, event.duration_s * self.acquisition.config.sample_rate)))
+        out_dir = Path('exports')
         out_dir.mkdir(exist_ok=True)
-        path = out_dir / f'detection_{int(event.timestamp)}_{int(event.center_freq)}.iq'
+        timestamp = datetime.fromtimestamp(event.timestamp).strftime('%Y%m%d_%H%M%S_%f')
+        path = out_dir / f'signal_{event.center_freq / 1e6:.3f}MHz_{timestamp}.iq'
         iq.astype(np.complex64).tofile(path)
+        QtWidgets.QMessageBox.information(self, 'Export I/Q', f'Fragment IQ salvat:\n{path}')
+
+    def _on_detection_double_clicked(self, item: QtWidgets.QTableWidgetItem) -> None:
+        self._copy_detection_frequency_to_watch_input(item.row())
+
+    def _copy_detection_frequency_to_watch_input(self, row: int) -> None:
+        if row < 0 or row >= len(self.detections):
+            return
+        event = list(self.detections)[row]
+        self.watch_input.setText(f'{event.center_freq:.0f}')
+        self.watch_input.setFocus()
+        self._log('INFO', f'Copied {event.center_freq:.0f} Hz to watchlist input from row {row}.')
+
+    def _send_detection_to_offline_analyzer(self, row: int) -> None:
+        if row < 0 or row >= len(self.detections):
+            return
+        iq = list(self._detection_iq_snippets)[row] if row < len(self._detection_iq_snippets) else np.array([], dtype=np.complex64)
+        if iq.size == 0:
+            self.iq_info.setText('Nu există fragment IQ disponibil pentru această detecție.')
+            return
+        frame = self.dsp.process(iq[: max(self.dsp.fft_size, 4096)])
+        event = list(self.detections)[row]
+        mod = frame.event.modulation if frame.event else event.modulation
+        snr = float(np.max(frame.fft_db) - np.median(frame.fft_db))
+        baud = frame.event.baud_rate if frame.event else event.baud_rate
+        self.iq_info.setText(
+            f'Detection @{event.center_freq:.0f} Hz | Samples: {iq.size} | Modulation: {mod} | SNR: {snr:.2f} dB | Baud: {baud:.1f}'
+        )
+
+    def _show_detection_context_menu(self, pos: QtCore.QPoint) -> None:
+        index = self.table.indexAt(pos)
+        if not index.isValid():
+            return
+        row = index.row()
+        menu = QtWidgets.QMenu(self.table)
+        watch_action = menu.addAction('Trimite în Watchlist')
+        analyzer_action = menu.addAction('Trimite în Offline Analyzer')
+        export_action = menu.addAction('Exportă fragment IQ')
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen == watch_action:
+            self._copy_detection_frequency_to_watch_input(row)
+        elif chosen == analyzer_action:
+            self._send_detection_to_offline_analyzer(row)
+        elif chosen == export_action:
+            self._export_detection_iq(row)
 
     def _retune(self, freq_hz: float) -> None:
         self.acquisition.update_params(center_freq=freq_hz)
@@ -559,7 +618,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         printer.setOutputFileName(str(path))
         doc = QtGui.QTextDocument()
         doc.setHtml(self._report_html())
-        doc.print(printer)
+        doc.print_(printer)
+        QtWidgets.QMessageBox.information(self, 'Export PDF', f'PDF salvat:\n{path}')
 
     def _set_error(self, message: str) -> None:
         self._last_error_message = message
