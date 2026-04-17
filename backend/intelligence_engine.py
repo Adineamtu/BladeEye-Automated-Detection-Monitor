@@ -94,6 +94,11 @@ class IntelligenceEngine:
         self._signatures = self._load_signatures(signatures_path)
         self._snr_guard_db = float(snr_guard_db)
         self._executor_mode = os.getenv("BLADEEYE_INTEL_EXECUTOR", "process").strip().lower()
+        default_in_flight = max(1, int(os.getenv("BLADEEYE_INTEL_WORKERS", "2")))
+        self._max_in_flight = max(
+            1,
+            int(os.getenv("BLADEEYE_INTEL_MAX_IN_FLIGHT", str(default_in_flight))),
+        )
 
     @staticmethod
     def _build_executor() -> Executor:
@@ -122,10 +127,38 @@ class IntelligenceEngine:
         import asyncio
 
         iq = np.asarray(iq, dtype=np.complex64)
+        loop = asyncio.get_running_loop()
+        return await self._submit_one(loop, iq)
+
+    async def analyze_many(
+        self,
+        iq_windows: list[np.ndarray],
+        *,
+        max_in_flight: int | None = None,
+    ) -> list[IntelligenceResult]:
+        """Run scatter-gather inference over multiple IQ windows."""
+        import asyncio
+
+        if not iq_windows:
+            return []
+        limit = max(1, int(max_in_flight or self._max_in_flight))
+        gate = asyncio.Semaphore(limit)
+
+        async def _run_one(iq_window: np.ndarray) -> IntelligenceResult:
+            iq_array = np.asarray(iq_window, dtype=np.complex64)
+            if iq_array.size == 0:
+                return _analyze_sync_worker(iq_array, self._signatures, self._snr_guard_db)
+            async with gate:
+                loop = asyncio.get_running_loop()
+                return await self._submit_one(loop, iq_array)
+
+        return await asyncio.gather(*[_run_one(iq_window) for iq_window in iq_windows])
+
+    async def _submit_one(self, loop, iq: np.ndarray) -> IntelligenceResult:
+        """Submit one IQ window to the configured executor backend."""
         if iq.size == 0:
             return _analyze_sync_worker(iq, self._signatures, self._snr_guard_db)
 
-        loop = asyncio.get_running_loop()
         if self._executor_mode == "process":
             segment = shared_memory.SharedMemory(create=True, size=int(iq.nbytes))
             try:
@@ -141,9 +174,16 @@ class IntelligenceEngine:
                 )
             finally:
                 segment.close()
-                segment.unlink()
+                try:
+                    segment.unlink()
+                except FileNotFoundError:
+                    pass
 
         return await loop.run_in_executor(self._pool, _analyze_sync_worker, iq, self._signatures, self._snr_guard_db)
+
+    def shutdown(self, wait: bool = True) -> None:
+        """Release the intelligence executor resources."""
+        self._pool.shutdown(wait=wait, cancel_futures=True)
 
     def _analyze_sync(self, iq: np.ndarray) -> IntelligenceResult:
         return _analyze_sync_worker(iq, self._signatures, self._snr_guard_db)
