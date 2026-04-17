@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from datetime import datetime
+import html
 from pathlib import Path
 import queue
 import threading
@@ -150,6 +151,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._dropped_chunks = 0
         self._last_error_message = 'None'
         self._error_log: deque[str] = deque(maxlen=5000)
+        self._raw_hex_max_chars = 64
 
         self._build_ui(config)
         self.acquisition.add_sink(self._on_iq_chunk)
@@ -288,11 +290,14 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         layout.addLayout(watch_bar)
         layout.addWidget(self.watch_list)
 
+        detections_area = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+
         self.table = QtWidgets.QTableWidget(0, 9)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.itemDoubleClicked.connect(self._on_detection_double_clicked)
+        self.table.itemSelectionChanged.connect(self._update_signal_details_panel)
         self.table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_detection_context_menu)
         self.table.setHorizontalHeaderLabels(
@@ -309,7 +314,19 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             ]
         )
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        layout.addWidget(self.table, stretch=2)
+        detections_area.addWidget(self.table)
+
+        details_panel = QtWidgets.QWidget(self)
+        details_layout = QtWidgets.QVBoxLayout(details_panel)
+        details_layout.addWidget(QtWidgets.QLabel('Signal Details'))
+        self.signal_details = QtWidgets.QPlainTextEdit(self)
+        self.signal_details.setReadOnly(True)
+        self.signal_details.setPlaceholderText('Selectează un rând pentru a vedea datele brute.')
+        details_layout.addWidget(self.signal_details, stretch=1)
+        details_panel.setMinimumWidth(350)
+        detections_area.addWidget(details_panel)
+        detections_area.setSizes([1100, 380])
+        layout.addWidget(detections_area, stretch=2)
 
         self.setCentralWidget(central)
 
@@ -440,13 +457,14 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
                 f'{evt.label} / {evt.protocol}',
                 f'{evt.signal_strength:.5f}',
                 f'{evt.duration_s:.4f}',
-                datetime.fromtimestamp(evt.timestamp).strftime('%H:%M:%S'),
+                datetime.fromtimestamp(evt.timestamp).strftime('%H:%M:%S.%f')[:-3],
             ]
             for c, value in enumerate(values):
                 self.table.setItem(r, c, QtWidgets.QTableWidgetItem(value))
             export_btn = QtWidgets.QPushButton('Export I/Q')
             export_btn.clicked.connect(lambda _, i=r: self._export_detection_iq(i))
             self.table.setCellWidget(r, 8, export_btn)
+        self._update_signal_details_panel()
 
     def _export_detection_iq(self, idx: int) -> None:
         if idx >= len(self.detections):
@@ -501,6 +519,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         watch_action = menu.addAction('Trimite în Watchlist')
         analyzer_action = menu.addAction('Trimite în Offline Analyzer')
         export_action = menu.addAction('Exportă fragment IQ')
+        identify_action = menu.addAction('Identify as...')
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen == watch_action:
             self._copy_detection_frequency_to_watch_input(row)
@@ -508,6 +527,64 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             self._send_detection_to_offline_analyzer(row)
         elif chosen == export_action:
             self._export_detection_iq(row)
+        elif chosen == identify_action:
+            self._identify_detection_as(row)
+
+    def _pulse_metrics_from_detection(self, row: int) -> tuple[float, float]:
+        event = list(self.detections)[row]
+        pulse_width_ms = max(event.duration_s * 1000.0, 0.001)
+        pulse_gap_ms = (1000.0 / event.baud_rate) if event.baud_rate > 0 else pulse_width_ms
+        return pulse_width_ms, pulse_gap_ms
+
+    def _identify_detection_as(self, row: int) -> None:
+        if row < 0 or row >= len(self.detections):
+            return
+        event = list(self.detections)[row]
+        current_name = event.label if event.label and "Unknown" not in event.label else ""
+        name, ok = QtWidgets.QInputDialog.getText(
+            self,
+            'Identify Signal',
+            'Label this signal as:',
+            text=current_name,
+        )
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        pulse_width_ms, pulse_gap_ms = self._pulse_metrics_from_detection(row)
+        self.dsp.save_user_label(
+            name=name,
+            pulse_width_ms=pulse_width_ms,
+            pulse_gap_ms=pulse_gap_ms,
+            modulation=event.modulation,
+        )
+        event.label = name
+        event.purpose = "User Tagged"
+        event.confidence = 1.0
+        self._render_detections()
+        QtWidgets.QMessageBox.information(self, 'Identify Signal', f'Semnal salvat în DB locală ca: {name}')
+
+    def _update_signal_details_panel(self) -> None:
+        selected = self.table.currentRow()
+        if selected < 0 or selected >= len(self.detections):
+            self.signal_details.setPlainText('')
+            return
+        event = list(self.detections)[selected]
+        details = [
+            f'Time: {datetime.fromtimestamp(event.timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}',
+            f'Frequency: {event.center_freq / 1e6:.6f} MHz ({event.center_freq:.0f} Hz)',
+            f'Modulation: {event.modulation}',
+            f'Baud: {event.baud_rate:.1f}',
+            f'RSSI/Strength: {event.signal_strength:.5f}',
+            f'Duration: {event.duration_s:.6f} s',
+            f'Label: {event.label}',
+            f'Purpose: {event.purpose}',
+            f'Protocol: {event.protocol}',
+            f'Confidence: {event.confidence * 100:.1f}%',
+            f'Raw Hex: {event.raw_hex or "(not available)"}',
+        ]
+        self.signal_details.setPlainText('\n'.join(details))
 
     def _retune(self, freq_hz: float) -> None:
         self.acquisition.update_params(center_freq=freq_hz)
@@ -596,11 +673,34 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.watch_list.addItems([f'{f:.0f}' for f in self.watchlist])
 
     def _report_html(self) -> str:
+        rows = []
+        for evt in list(self.detections):
+            label = evt.label or "Unknown / Raw Signal"
+            safe_label = html.escape(label)
+            if safe_label.startswith("Unknown"):
+                safe_label = f"{safe_label} (User Tag: n/a)"
+            rows.append(
+                "<tr>"
+                f"<td>{datetime.fromtimestamp(evt.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}</td>"
+                f"<td>{evt.center_freq / 1e6:.6f} MHz</td>"
+                f"<td>{html.escape(evt.modulation)}</td>"
+                f"<td>{evt.baud_rate:.1f}</td>"
+                f"<td>{safe_label}</td>"
+                f"<td>{evt.signal_strength:.5f}</td>"
+                f"<td>{html.escape((evt.raw_hex or '')[:self._raw_hex_max_chars])}</td>"
+                "</tr>"
+            )
+        table_html = (
+            "<table border='1' cellspacing='0' cellpadding='4'>"
+            "<thead><tr><th>Time</th><th>Freq</th><th>Mod</th><th>Baud</th><th>Label</th><th>Signal Strength</th><th>Raw Hex</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>"
+        )
         return (
-            '<h1>BladeEye Option D Report</h1>'
+            '<h1>BladeEye Full Intelligence Report</h1>'
             f'<p>Generated: {datetime.utcnow().isoformat()}Z</p>'
             f'<p>Detections: {len(self.detections)}</p>'
             f'<p>Watchlist: {", ".join(f"{f:.0f}" for f in self.watchlist) or "none"}</p>'
+            f'{table_html}'
         )
 
     def _export_report(self) -> None:

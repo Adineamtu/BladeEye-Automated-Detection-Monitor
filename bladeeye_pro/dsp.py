@@ -39,6 +39,14 @@ class DSPEngine:
     def set_trigger_gain(self, gain: float) -> None:
         self._trigger_gain = max(1.0, float(gain))
 
+    def save_user_label(self, *, name: str, pulse_width_ms: float, pulse_gap_ms: float, modulation: str) -> dict[str, object]:
+        return self._classifier.save_user_label(
+            name=name,
+            pulse_width_ms=pulse_width_ms,
+            pulse_gap_ms=pulse_gap_ms,
+            modulation=modulation,
+        )
+
     @staticmethod
     def _estimate_baud_rate(active_edges: np.ndarray, sample_rate: float) -> float:
         if active_edges.size < 2:
@@ -88,7 +96,7 @@ class DSPEngine:
 
             mod = ModulationDetector.detect(iq)
             pulse_gap_ms = float(np.mean(np.diff(starts)) / self.sample_rate * 1000.0) if starts.size > 1 else 0.0
-            label, purpose = self._classifier.classify(pulse_width_ms, pulse_gap_ms, mod)
+            label, purpose, confidence = self._classifier.classify(pulse_width_ms, pulse_gap_ms, mod)
             baud_rate = self._estimate_baud_rate(starts, self.sample_rate)
             protocol = self._protocol_from_modulation(mod, baud_rate)
             duration_s = max(pulse_width_ms / 1000.0, 1.0 / self.sample_rate)
@@ -99,6 +107,7 @@ class DSPEngine:
                 anchor = int(iq.size * 0.5)
             begin = int(np.clip(anchor - snippet_samples // 2, 0, max(0, iq.size - snippet_samples)))
             detection_iq = iq[begin : begin + snippet_samples].copy()
+            raw_bytes = detection_iq.astype(np.complex64).tobytes()[:16]
             event = DetectionEvent(
                 timestamp=__import__("time").time(),
                 center_freq=self.center_freq,
@@ -110,6 +119,8 @@ class DSPEngine:
                 purpose=purpose,
                 protocol=protocol,
                 label=label,
+                confidence=confidence,
+                raw_hex=raw_bytes.hex(),
             )
 
         return DSPFrame(
