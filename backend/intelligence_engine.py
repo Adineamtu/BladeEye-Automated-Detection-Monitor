@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
+from multiprocessing import shared_memory
 import os
 from pathlib import Path
 import json
@@ -56,6 +57,21 @@ def _analyze_sync_worker(iq: np.ndarray, signatures: list[dict], snr_guard_db: f
     )
 
 
+def _analyze_sync_worker_from_shm(
+    shm_name: str,
+    iq_count: int,
+    signatures: list[dict],
+    snr_guard_db: float,
+) -> "IntelligenceResult":
+    """Read IQ samples from shared memory and run synchronous analysis."""
+    segment = shared_memory.SharedMemory(name=shm_name)
+    try:
+        iq = np.ndarray((int(iq_count),), dtype=np.complex64, buffer=segment.buf)
+        return _analyze_sync_worker(iq, signatures, snr_guard_db)
+    finally:
+        segment.close()
+
+
 @dataclass
 class IntelligenceResult:
     """Output of intelligence inference for one I/Q snapshot."""
@@ -77,11 +93,13 @@ class IntelligenceEngine:
         self._pool = self._build_executor()
         self._signatures = self._load_signatures(signatures_path)
         self._snr_guard_db = float(snr_guard_db)
+        self._executor_mode = os.getenv("BLADEEYE_INTEL_EXECUTOR", "process").strip().lower()
 
     @staticmethod
     def _build_executor() -> Executor:
-        workers = max(2, int(os.getenv("BLADEEYE_INTEL_WORKERS", "2")))
-        mode = os.getenv("BLADEEYE_INTEL_EXECUTOR", "thread").strip().lower()
+        default_workers = max(2, (os.cpu_count() or 2) - 1)
+        workers = max(2, int(os.getenv("BLADEEYE_INTEL_WORKERS", str(default_workers))))
+        mode = os.getenv("BLADEEYE_INTEL_EXECUTOR", "process").strip().lower()
         if mode == "process":
             return ProcessPoolExecutor(max_workers=workers)
         return ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bladeeye-intel")
@@ -96,10 +114,35 @@ class IntelligenceEngine:
             return []
 
     async def analyze(self, iq: np.ndarray) -> IntelligenceResult:
-        """Run CPU-heavy inference in thread-pool executor."""
+        """Run CPU-heavy inference in executor.
+
+        Process mode uses a per-call shared-memory segment so the IQ payload
+        is not serialized and copied through inter-process pipes.
+        """
         import asyncio
 
+        iq = np.asarray(iq, dtype=np.complex64)
+        if iq.size == 0:
+            return _analyze_sync_worker(iq, self._signatures, self._snr_guard_db)
+
         loop = asyncio.get_running_loop()
+        if self._executor_mode == "process":
+            segment = shared_memory.SharedMemory(create=True, size=int(iq.nbytes))
+            try:
+                shared_iq = np.ndarray(iq.shape, dtype=np.complex64, buffer=segment.buf)
+                shared_iq[:] = iq
+                return await loop.run_in_executor(
+                    self._pool,
+                    _analyze_sync_worker_from_shm,
+                    segment.name,
+                    int(iq.size),
+                    self._signatures,
+                    self._snr_guard_db,
+                )
+            finally:
+                segment.close()
+                segment.unlink()
+
         return await loop.run_in_executor(self._pool, _analyze_sync_worker, iq, self._signatures, self._snr_guard_db)
 
     def _analyze_sync(self, iq: np.ndarray) -> IntelligenceResult:
