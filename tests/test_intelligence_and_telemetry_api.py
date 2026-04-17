@@ -33,6 +33,28 @@ def test_intelligence_classify_file_endpoint_accepts_complex64_upload():
     assert "snr_db" in data
 
 
+def test_intelligence_classify_batch_endpoint_returns_items():
+    client = TestClient(api.app)
+    payload = {
+        "windows": [
+            {
+                "iq_real": [0.1, 0.2, -0.1, -0.2],
+                "iq_imag": [0.0, 0.1, 0.0, -0.1],
+            },
+            {
+                "iq_real": [0.5, 0.4, 0.3, 0.2],
+                "iq_imag": [0.2, 0.1, 0.0, -0.1],
+            },
+        ]
+    }
+    resp = client.post("/api/intelligence/classify-batch", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "items" in body
+    assert len(body["items"]) == 2
+    assert all("modulation_type" in item for item in body["items"])
+
+
 def test_telemetry_and_logs_endpoints_are_available():
     client = TestClient(api.app)
     telemetry = client.get("/api/telemetry")

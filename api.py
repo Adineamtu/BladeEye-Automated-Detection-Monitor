@@ -8,7 +8,7 @@ from typing import Any, Callable, List, Optional
 from collections import deque
 from pathlib import Path
 from pydantic import BaseModel
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import mmap
 import os
 import subprocess
@@ -59,8 +59,6 @@ from backend.sigint_log import SigintLogStore, SigintEvent
 try:  # pragma: no cover - fallback exercised in tests
     from backend.passive_monitor import Signal
 except Exception:  # pragma: no cover
-    from dataclasses import dataclass
-
     @dataclass
     class Signal:  # type: ignore
         center_frequency: float
@@ -171,6 +169,17 @@ _auto_action_state: dict[str, bool] = {}
 _last_action_trigger_at: dict[str, float] = {}
 _ai_last_activity_ts: float = 0.0
 _ai_jobs_processed: int = 0
+_live_intel_event_loop: asyncio.AbstractEventLoop | None = None
+_live_intel_queue: asyncio.Queue | None = None
+_live_intel_task: asyncio.Task | None = None
+_LIVE_INTEL_BATCH_SIZE = max(1, int(os.getenv("BLADEEYE_LIVE_INTEL_BATCH_SIZE", "8")))
+_LIVE_INTEL_QUEUE_SIZE = max(1, int(os.getenv("BLADEEYE_LIVE_INTEL_QUEUE_SIZE", "32")))
+
+
+@dataclass
+class _LiveIntelBatch:
+    signals: list[Signal]
+    iq_windows: list[np.ndarray]
 
 
 def _runtime_snapshot() -> dict:
@@ -195,6 +204,31 @@ def _mark_ai_activity() -> None:
     global _ai_last_activity_ts, _ai_jobs_processed
     _ai_last_activity_ts = time.time()
     _ai_jobs_processed += 1
+
+
+async def _live_intel_loop() -> None:
+    """Background live intelligence worker (scatter-gather classification)."""
+    if _live_intel_queue is None:
+        return
+    while True:
+        batch = await _live_intel_queue.get()
+        try:
+            if batch is None:
+                return
+            results = await intelligence_engine.analyze_many(batch.iq_windows)
+            for sig, result in zip(batch.signals, results):
+                sig.modulation_type = result.modulation_type
+                sig.baud_rate = result.baud_rate
+                if result.protocol_name:
+                    sig.protocol_name = result.protocol_name
+                if result.likely_purpose:
+                    sig.likely_purpose = result.likely_purpose
+                setattr(sig, "confidence", result.confidence)
+                _mark_ai_activity()
+        except Exception:
+            log.exception("Live intelligence batch failed")
+        finally:
+            _live_intel_queue.task_done()
 
 
 async def _autosave_loop() -> None:
@@ -229,7 +263,9 @@ jinja_env = Environment(
 async def _startup() -> None:
     """Initialize autosave and preload any recovery data."""
     SESSIONS_DIR.mkdir(exist_ok=True)
-    global _recovery_cache, execution_board, preflight_status, zmq_consumer
+    global _recovery_cache, execution_board, preflight_status, zmq_consumer, intelligence_engine
+    global _live_intel_event_loop, _live_intel_queue, _live_intel_task
+    intelligence_engine = IntelligenceEngine(BASE_DIR / "backend" / "signatures.json")
     if AUTOSAVE_FILE.exists():
         try:
             with open(AUTOSAVE_FILE, "r", encoding="utf-8") as fh:
@@ -254,6 +290,9 @@ async def _startup() -> None:
         _safe_startup_probe()
     _bind_monitor_analysis_callback()
     asyncio.create_task(_autosave_loop())
+    _live_intel_event_loop = asyncio.get_running_loop()
+    _live_intel_queue = asyncio.Queue(maxsize=_LIVE_INTEL_QUEUE_SIZE)
+    _live_intel_task = asyncio.create_task(_live_intel_loop())
     await sigint_store.start()
     if os.getenv("SDR_WATCHDOG_ENABLED", "0") == "1":
         asyncio.create_task(_watchdog_loop())
@@ -262,7 +301,24 @@ async def _startup() -> None:
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     """Release optional runtime resources."""
-    global zmq_consumer
+    global zmq_consumer, _live_intel_event_loop, _live_intel_queue, _live_intel_task
+    if _live_intel_queue is not None:
+        try:
+            while True:
+                _live_intel_queue.get_nowait()
+                _live_intel_queue.task_done()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            _live_intel_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+    if _live_intel_task is not None:
+        await _live_intel_task
+    _live_intel_task = None
+    _live_intel_queue = None
+    _live_intel_event_loop = None
+    intelligence_engine.shutdown(wait=True)
     await sigint_store.stop()
     sigint_store.close()
     if zmq_consumer is not None:
@@ -350,6 +406,10 @@ class ExecutionTaskPatchPayload(BaseModel):
 class IntelligenceIQPayload(BaseModel):
     iq_real: List[float]
     iq_imag: List[float]
+
+
+class IntelligenceBatchIQPayload(BaseModel):
+    windows: List[IntelligenceIQPayload]
 
 
 class AutoActionPayload(BaseModel):
@@ -708,6 +768,7 @@ def _remember_signals(new_signals: List[Signal]) -> None:
     """Persist latest detections in a circular in-memory buffer."""
     if new_signals:
         _mark_ai_activity()
+    _schedule_live_intelligence(new_signals)
     for sig in new_signals:
         _apply_rf_signature_match(sig)
         if getattr(sig, "likely_purpose", None) is None:
@@ -717,6 +778,70 @@ def _remember_signals(new_signals: List[Signal]) -> None:
         _capture_sigint_event(sig)
     signals.clear()
     signals.extend(list(recent_signals))
+
+
+def _signal_needs_live_intelligence(sig: Signal) -> bool:
+    """Return ``True`` when live classify should enrich a signal."""
+    if getattr(sig, "protocol_name", None):
+        return False
+    if getattr(sig, "modulation_type", None) and getattr(sig, "baud_rate", None):
+        return False
+    return True
+
+
+def _build_live_intel_batch(new_signals: List[Signal]) -> _LiveIntelBatch | None:
+    """Build a bounded IQ batch for live scatter-gather intelligence."""
+    if not new_signals:
+        return None
+    if monitor is None or not hasattr(monitor, "get_iq_export"):
+        return None
+
+    candidates: list[Signal] = []
+    windows: list[np.ndarray] = []
+    for sig in new_signals:
+        if len(candidates) >= _LIVE_INTEL_BATCH_SIZE:
+            break
+        if not _signal_needs_live_intelligence(sig):
+            continue
+        frequency = getattr(sig, "center_frequency", None)
+        if frequency is None:
+            continue
+        try:
+            iq = np.asarray(monitor.get_iq_export(float(frequency)), dtype=np.complex64)
+        except Exception:
+            continue
+        if iq.size == 0:
+            continue
+        candidates.append(sig)
+        windows.append(iq)
+    if not candidates:
+        return None
+    return _LiveIntelBatch(signals=candidates, iq_windows=windows)
+
+
+def _schedule_live_intelligence(new_signals: List[Signal]) -> None:
+    """Thread-safe enqueue for async live intelligence worker."""
+    batch = _build_live_intel_batch(new_signals)
+    if batch is None:
+        return
+    if _live_intel_event_loop is None or _live_intel_queue is None:
+        return
+
+    def _enqueue() -> None:
+        if _live_intel_queue is None:
+            return
+        if _live_intel_queue.full():
+            try:
+                _live_intel_queue.get_nowait()
+                _live_intel_queue.task_done()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            _live_intel_queue.put_nowait(batch)
+        except asyncio.QueueFull:
+            pass
+
+    _live_intel_event_loop.call_soon_threadsafe(_enqueue)
 
 
 def _estimate_signal_confidence(sig: Signal) -> float:
@@ -953,6 +1078,7 @@ def recover_session() -> dict:
 def list_sessions() -> List[str]:
     """Return a list of available session JSON filenames."""
     SESSIONS_DIR.mkdir(exist_ok=True)
+    intelligence_engine = IntelligenceEngine(BASE_DIR / "backend" / "signatures.json")
     return sorted([p.name for p in SESSIONS_DIR.glob("*.json")])
 
 
@@ -1346,14 +1472,19 @@ def get_frequency_trace(frequency: float) -> dict:
     return {"times": times, "frequencies": freqs}
 
 
-@app.post("/api/intelligence/classify")
-async def classify_iq(payload: IntelligenceIQPayload) -> dict:
-    """Analyze an IQ window and infer modulation, RSSI, baud and fingerprint."""
+def _build_iq_array(payload: IntelligenceIQPayload) -> np.ndarray:
+    """Validate IQ payload parts and return a complex64 array."""
     if len(payload.iq_real) != len(payload.iq_imag):
         raise HTTPException(status_code=422, detail="iq_real and iq_imag must have equal length")
     if not payload.iq_real:
         raise HTTPException(status_code=422, detail="IQ payload cannot be empty")
-    iq = np.asarray(payload.iq_real, dtype=np.float32) + 1j * np.asarray(payload.iq_imag, dtype=np.float32)
+    return np.asarray(payload.iq_real, dtype=np.float32) + 1j * np.asarray(payload.iq_imag, dtype=np.float32)
+
+
+@app.post("/api/intelligence/classify")
+async def classify_iq(payload: IntelligenceIQPayload) -> dict:
+    """Analyze an IQ window and infer modulation, RSSI, baud and fingerprint."""
+    iq = _build_iq_array(payload)
     result = await intelligence_engine.analyze(iq)
     _mark_ai_activity()
     return {
@@ -1365,6 +1496,32 @@ async def classify_iq(payload: IntelligenceIQPayload) -> dict:
         "confidence": result.confidence,
         "snr_db": result.snr_db,
         "ignored_as_noise": result.ignored_as_noise,
+    }
+
+
+@app.post("/api/intelligence/classify-batch")
+async def classify_iq_batch(payload: IntelligenceBatchIQPayload) -> dict:
+    """Analyze a batch of IQ windows with bounded scatter-gather execution."""
+    if not payload.windows:
+        raise HTTPException(status_code=422, detail="Batch payload cannot be empty")
+    iq_windows = [_build_iq_array(window) for window in payload.windows]
+    results = await intelligence_engine.analyze_many(iq_windows)
+    for _ in results:
+        _mark_ai_activity()
+    return {
+        "items": [
+            {
+                "modulation_type": result.modulation_type,
+                "signal_strength_rssi_db": result.rssi_db,
+                "baud_rate": result.baud_rate,
+                "likely_purpose": result.likely_purpose,
+                "protocol_name": result.protocol_name,
+                "confidence": result.confidence,
+                "snr_db": result.snr_db,
+                "ignored_as_noise": result.ignored_as_noise,
+            }
+            for result in results
+        ]
     }
 
 
