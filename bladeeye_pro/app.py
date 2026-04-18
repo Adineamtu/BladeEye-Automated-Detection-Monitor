@@ -169,6 +169,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._lab_signature_db_loaded = False
         self._recording_mode_enabled = False
         self._recording_ui_counter = 0
+        self._last_presence_detection_ts = 0.0
+        self._presence_detection_cooldown_s = 0.35
         self._waterfall_suspended_for_lab = False
         self._record_blink_on = False
 
@@ -374,6 +376,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             ]
         )
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.table.setToolTip(
+            'Baud/Protocol sunt estimate avansate. În PREVIEW pot apărea N/A, iar în REC apar doar marker-e "Captured/Pending Lab".'
+        )
         detections_area.addWidget(self.table)
 
         details_panel = QtWidgets.QWidget(self)
@@ -465,6 +470,10 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         with self._state_lock:
             self._last_chunk_ts = 0.0
             self._last_latency_ms = 0.0
+            self._dropped_chunks = 0
+        self.sdr_worker.dropped_input_chunks = 0
+        self.sdr_worker.dropped_ready_frames = 0
+        self.dropped_label.setText('Dropped: 0')
         self.scan_status.setText('Scan Status: Stopped')
         self.status_label.setText('SDR Core Health: Idle')
         self.status_label.setStyleSheet('')
@@ -489,6 +498,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             capture_logger = self._capture_logger
             if capture_logger is not None:
                 capture_logger.ingest(chunk)
+                self._append_presence_detection(chunk)
                 return
             if self._waterfall_suspended_for_lab:
                 return
@@ -497,6 +507,38 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
                     self._dropped_chunks += 1
         except Exception as exc:
             self._set_error(f'Chunk processing failed: {exc}')
+
+    def _append_presence_detection(self, chunk: np.ndarray) -> None:
+        """Lightweight REC path: only mark signal presence for later LAB analysis."""
+        if chunk.size == 0:
+            return
+        now = time.time()
+        if now - self._last_presence_detection_ts < self._presence_detection_cooldown_s:
+            return
+        rssi = float(np.mean(np.abs(chunk) ** 2))
+        trigger = max(1.0, float(self.alert_threshold.value()) / 125000.0)
+        if rssi < trigger:
+            return
+        self._last_presence_detection_ts = now
+        sr = max(float(self.acquisition.config.sample_rate), 1.0)
+        duration_s = max(float(chunk.size) / sr, 1.0 / sr)
+        event = DetectionEvent(
+            timestamp=now,
+            center_freq=float(self.acquisition.config.center_freq),
+            energy=rssi,
+            signal_strength=float(np.max(np.abs(chunk))),
+            duration_s=duration_s,
+            modulation='Captured',
+            baud_rate=0.0,
+            purpose='Pending Lab',
+            protocol='Pending Lab',
+            label='Captured',
+            confidence=0.0,
+            raw_hex='',
+        )
+        self.detections.appendleft(event)
+        self._detection_iq_snippets.appendleft(np.array([], dtype=np.complex64))
+        self._pending_detection_table_refresh = True
 
     def _on_acquisition_error(self, message: str) -> None:
         self._set_error(message)
@@ -513,6 +555,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         with self._state_lock:
             dropped_chunks = self._dropped_chunks + self.sdr_worker.dropped_ready_frames
             latency_ms = self._last_latency_ms
+        if self._capture_logger is not None:
+            dropped_chunks += self._capture_logger.dropped_chunks
         self.dropped_label.setText(f'Dropped: {dropped_chunks}')
         self.latency_label.setText(f'Latency: {latency_ms:.1f}ms')
         self.error_label.setText(f'Errors: {self._last_error_message}')
@@ -551,12 +595,15 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         rows = [all_rows[idx] for idx in self._visible_detection_indices]
         self.table.setRowCount(len(rows))
         for r, evt in enumerate(rows):
+            baud_display = f'{evt.baud_rate:.1f}' if evt.baud_rate > 0 else 'Pending Lab'
+            purpose_display = evt.purpose if evt.purpose else 'Pending Lab'
+            protocol_display = evt.protocol if evt.protocol else 'Pending Lab'
             values = [
                 f'{evt.center_freq:.0f}',
                 evt.modulation,
-                f'{evt.baud_rate:.1f}',
-                evt.purpose,
-                f'{evt.label} / {evt.protocol}',
+                baud_display,
+                purpose_display,
+                f'{evt.label} / {protocol_display}',
                 f'{evt.signal_strength:.5f}',
                 f'{evt.duration_s:.4f}',
                 datetime.fromtimestamp(evt.timestamp).strftime('%H:%M:%S.%f')[:-3],
@@ -688,12 +735,12 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             f'Time: {datetime.fromtimestamp(event.timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}',
             f'Frequency: {event.center_freq / 1e6:.6f} MHz ({event.center_freq:.0f} Hz)',
             f'Modulation: {event.modulation}',
-            f'Baud: {event.baud_rate:.1f}',
+            (f'Baud: {event.baud_rate:.1f}' if event.baud_rate > 0 else 'Baud: Pending Lab'),
             f'RSSI/Strength: {event.signal_strength:.5f}',
             f'Duration: {event.duration_s:.6f} s',
             f'Label: {event.label}',
             f'Purpose: {event.purpose}',
-            f'Protocol: {event.protocol}',
+            f'Protocol: {event.protocol or "Pending Lab"}',
             f'Confidence: {event.confidence * 100:.1f}%',
             f'Raw Hex: {event.raw_hex or "(not available)"}',
         ]
@@ -735,6 +782,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._capture_logger.start()
         self._recording_mode_enabled = True
         self._recording_ui_counter = 0
+        self._last_presence_detection_ts = 0.0
         self.spectrum.setStyleSheet('border: 2px solid #D71818;')
         self.record_btn.setText('Stop Capture (0.00 GB)')
         self.iq_info.setText(
@@ -844,6 +892,11 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         if lab_active:
             self.scan_status.setText('Scan Status: LAB mode (waterfall paused)')
         elif self._is_scanning:
+            with self._state_lock:
+                self._dropped_chunks = 0
+            self.sdr_worker.dropped_input_chunks = 0
+            self.sdr_worker.dropped_ready_frames = 0
+            self.dropped_label.setText('Dropped: 0')
             self.scan_status.setText('Scan Status: Running')
         else:
             self.scan_status.setText('Scan Status: Stopped')
