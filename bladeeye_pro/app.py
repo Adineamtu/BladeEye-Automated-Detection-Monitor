@@ -165,6 +165,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self._pending_detection_table_refresh = False
         self._capture_logger: AsyncRawCaptureLogger | None = None
         self._lab_analyzer: PowerIndexAnalyzer | None = None
+        self._lab_events: list[dict] = []
+        self._lab_signature_db_loaded = False
         self._recording_mode_enabled = False
         self._recording_ui_counter = 0
         self._waterfall_suspended_for_lab = False
@@ -315,12 +317,21 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.iq_drop = DropIqWidget(self)
         self.iq_drop.fileDropped.connect(self._analyze_offline_iq)
         self.iq_info = QtWidgets.QLabel('No offline file loaded.')
+        self.lab_load_btn = QtWidgets.QPushButton('LOAD SESSION')
+        self.lab_load_btn.clicked.connect(self._load_lab_session)
         self.encoding_compare_label = QtWidgets.QLabel('Encoding Toolbox (comparativ)')
         self.encoding_compare = QtWidgets.QPlainTextEdit(self)
         self.encoding_compare.setReadOnly(True)
         self.encoding_compare.setMaximumHeight(170)
         self.encoding_compare.setPlaceholderText('Rezultatele Manchester/PWM/Bit inversion vor apărea aici.')
+        self.lab_events_list = QtWidgets.QListWidget(self)
+        self.lab_events_list.itemSelectionChanged.connect(self._on_lab_event_selected)
+        self.lab_events_list.setMaximumHeight(180)
+        self.lab_events_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         lab_layout.addWidget(self.iq_drop)
+        lab_layout.addWidget(self.lab_load_btn)
+        lab_layout.addWidget(QtWidgets.QLabel('Energy Events (click-to-analyze)'))
+        lab_layout.addWidget(self.lab_events_list)
         lab_layout.addWidget(self.iq_info)
         lab_layout.addWidget(self.encoding_compare_label)
         lab_layout.addWidget(self.encoding_compare)
@@ -742,14 +753,85 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.spectrum.setStyleSheet('')
         self.record_btn.setText('ARM & RECORD')
         self.record_btn.setStyleSheet('')
-        self._lab_analyzer = PowerIndexAnalyzer(capture_path, index_path)
-        self.iq_info.setText(
-            f"THE LAB ready: index with {len(self._lab_analyzer.index.get('events', []))} events loaded from {index_path.name}."
-        )
+        self._set_lab_session(capture_path, index_path)
         QtWidgets.QMessageBox.information(
             self,
             'Capture complete',
             f'Raw capture: {capture_path}\\nIndex: {index_path}',
+        )
+
+    def _load_lab_session(self) -> None:
+        capture_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            'Load capture session',
+            str(Path.cwd() / 'sessions'),
+            'IQ Files (*.iq *.complex)',
+        )
+        if not capture_path:
+            return
+        capture = Path(capture_path)
+        guessed_index = capture.with_suffix(capture.suffix + '.index.json')
+        if guessed_index.exists():
+            index_path = guessed_index
+        else:
+            selected_index, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                'Select index file',
+                str(capture.parent),
+                'Index Files (*.json)',
+            )
+            if not selected_index:
+                return
+            index_path = Path(selected_index)
+        self._set_lab_session(capture, index_path)
+
+    def _set_lab_session(self, capture_path: Path, index_path: Path) -> None:
+        self._lab_analyzer = PowerIndexAnalyzer(capture_path, index_path)
+        self._lab_events = list(self._lab_analyzer.index.get('events', []))
+        self.lab_events_list.clear()
+        for idx, event in enumerate(self._lab_events, start=1):
+            ts = datetime.fromtimestamp(float(event.get('timestamp', 0.0))).strftime('%H:%M:%S') if event.get('timestamp') else '--:--:--'
+            rssi = float(event.get('rssi', 0.0))
+            peak = float(event.get('peak_power', 0.0))
+            self.lab_events_list.addItem(f'#{idx:03d}  t={ts}  RSSI={rssi:.4f}  Peak={peak:.4f}')
+        self._lab_signature_db_loaded = False
+        self.encoding_compare.setPlainText('')
+        self.iq_info.setText(
+            f"THE LAB ready: {len(self._lab_events)} indexed events loaded from {Path(index_path).name}. "
+            "Select one event to run AI/decode."
+        )
+
+    def _on_lab_event_selected(self) -> None:
+        analyzer = self._lab_analyzer
+        row = self.lab_events_list.currentRow()
+        if analyzer is None or row < 0 or row >= len(self._lab_events):
+            return
+        event = self._lab_events[row]
+        iq = analyzer.extract_event_window(event, pre_seconds=0.02, post_seconds=0.12)
+        if iq.size == 0:
+            self.iq_info.setText(f'Event #{row + 1}: empty IQ slice.')
+            self.encoding_compare.setPlainText('')
+            return
+        report = analyzer.analyze_event_window(event, iq, lowpass_cutoff_hz=min(120_000.0, analyzer.sample_rate / 2.0))
+        bitstream = self._iq_to_bitstream(iq)
+        self._render_encoding_toolbox(bitstream)
+        if not self._lab_signature_db_loaded:
+            sig_db_path = Path(__file__).resolve().parents[1] / 'backend' / 'signatures.json'
+            if sig_db_path.exists():
+                analyzer.load_signature_db(sig_db_path)
+            self._lab_signature_db_loaded = True
+        match = analyzer.automated_db_lookup(
+            bitstream=bitstream,
+            frequency_hz=None,
+            modulation=report.get('estimated_modulation'),
+            baud_rate=report.get('estimated_baud_rate'),
+        )
+        match_line = 'No signature match'
+        if match is not None:
+            match_line = f'Match: {match.label} ({match.score * 100:.1f}%)'
+        self.iq_info.setText(
+            f'Event #{row + 1} | Samples: {iq.size} | Modulation: {report.get("estimated_modulation", "UNKNOWN")} | '
+            f'Baud: {float(report.get("estimated_baud_rate", 0.0)):.1f} | {match_line}'
         )
 
     def _on_tab_changed(self, index: int) -> None:
@@ -793,18 +875,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
     def _analyze_offline_iq(self, path: str) -> None:
         try:
-            if self._lab_analyzer is not None:
-                events = list(self._lab_analyzer.iter_signal_windows())
-                if events:
-                    snippets = [window for _, window in events if window.size]
-                    if snippets:
-                        data = np.concatenate(snippets)
-                    else:
-                        data = np.fromfile(path, dtype=np.complex64)
-                else:
-                    data = np.fromfile(path, dtype=np.complex64)
-            else:
-                data = np.fromfile(path, dtype=np.complex64)
+            data = np.fromfile(path, dtype=np.complex64)
             if data.size == 0:
                 raise ValueError('file empty')
             with self._dsp_lock:

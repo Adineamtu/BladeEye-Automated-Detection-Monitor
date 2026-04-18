@@ -207,17 +207,25 @@ class PowerIndexAnalyzer:
         self.signature_db: list[dict] = []
 
     def iter_signal_windows(self, pre_seconds: float = 0.1, post_seconds: float = 0.5):
-        data = np.fromfile(self.capture_path, dtype=np.complex64)
+        for event in self.index.get("events", []):
+            window = self.extract_event_window(event, pre_seconds=pre_seconds, post_seconds=post_seconds)
+            if window.size:
+                yield event, window
+
+    def extract_event_window(self, event: dict, *, pre_seconds: float = 0.1, post_seconds: float = 0.5) -> np.ndarray:
+        """Read only the requested IQ slice for one indexed event."""
+        itemsize = np.dtype(np.complex64).itemsize
+        sample_index = int(event.get("sample_index", 0))
+        indexed_start = int(event.get("pre_trigger_start_sample", sample_index))
         pre = int(max(0, pre_seconds) * self.sample_rate)
         post = int(max(0, post_seconds) * self.sample_rate)
-        for event in self.index.get("events", []):
-            sample_index = int(event.get("sample_index", 0))
-            indexed_start = int(event.get("pre_trigger_start_sample", sample_index))
-            start = max(0, indexed_start - pre)
-            stop = min(data.size, sample_index + post)
-            if stop <= start:
-                continue
-            yield event, data[start:stop]
+        start = max(0, indexed_start - pre)
+        total_samples = int(self.capture_path.stat().st_size // itemsize)
+        stop = min(total_samples, sample_index + post)
+        count = max(0, stop - start)
+        if count <= 0:
+            return np.array([], dtype=np.complex64)
+        return np.fromfile(self.capture_path, dtype=np.complex64, count=count, offset=start * itemsize)
 
     def low_pass_filter(self, iq_window: np.ndarray, cutoff_hz: float) -> np.ndarray:
         """Low-pass filter around DC using FFT masking (offline cleanup)."""
