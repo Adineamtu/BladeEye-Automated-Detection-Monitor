@@ -17,11 +17,13 @@ def test_session_store_roundtrip(tmp_path: Path):
         config=HardwareConfig(center_freq=868e6, sample_rate=5e6, gain=32.0),
         watchlist=[433_920_000.0, 868_300_000.0],
         detections=[],
+        runtime_source="sidecar",
     )
     store.save(session)
     loaded = store.load("opd_case")
     assert loaded.name == "opd_case"
     assert loaded.watchlist == [433_920_000.0, 868_300_000.0]
+    assert loaded.runtime_source == "sidecar"
 
 
 def test_sigint_logger_persists_detection(tmp_path: Path):
