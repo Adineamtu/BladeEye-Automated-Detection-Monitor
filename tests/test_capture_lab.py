@@ -51,6 +51,9 @@ def test_async_raw_logger_creates_index_and_analyzer(tmp_path: Path) -> None:
     assert windows
     assert windows[0][1].dtype == np.complex64
     first_event = windows[0][0]
+    first_window = analyzer.extract_event_window(first_event, pre_seconds=0.0, post_seconds=0.01)
+    assert first_window.size > 0
+    assert first_window.dtype == np.complex64
     assert "peak_power" in first_event
     assert "pre_trigger_start_sample" in first_event
     assert first_event["pre_trigger_samples"] == int(0.12 * 1_000_000.0)
