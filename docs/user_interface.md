@@ -1,42 +1,82 @@
-# BladeEye Option D - User Interface
+# BladeEye Pro User Interface Guide
 
-## Header (Status)
-- **SDR Core Health**: healthy/idle + latență + dropped chunks.
-- **Scan Status**: Running / Stopped.
-- **WebSocket state**: N/A pentru runtime desktop (fără browser bridge).
+This guide covers the current desktop UI and its two main tabs: **Monitor** and **Lab**.
 
-## Session & Reporting
-- Session selector (dropdown).
-- **Load Session** / **Save Session**.
-- **Download Report** (HTML).
-- **Export as PDF**.
-- **Start** / **Stop** control global.
+## 1) Global Header
 
-## RF Control Panel
-- Presets: 433 / 868 / 915 MHz.
-- Center frequency control.
-- Sample rate slider.
-- Gain slider.
-- Alert threshold numeric.
-- Active frequency display.
-- Enable hopping checkbox.
+The header exposes runtime telemetry and health indicators:
 
-## Offline IQ Analyzer
-- Drag & Drop + Browse pentru fișiere `.iq` / `.complex`.
-- File info: nume, samples, modulation, SNR, baud.
+- **SDR Core Health**: running/idle status.
+- **Scan Status**: active or stopped acquisition state.
+- **Dropped**: dropped chunk counter under load.
+- **Errors**: latest error summary.
+- **Latency**: recent processing latency indicator.
 
-## Watchlist
-- Add frequency.
-- Remove selected.
-- Active watchlist list view.
+These indicators should be checked first before interpreting detections.
 
-## Detected Signals Table
-- Center Frequency
-- Modulation Type
-- Baud Rate
-- Detection / Likely Purpose
-- Label / Protocol
-- Signal Strength
-- Duration (s)
-- Time
-- Actions (Export I/Q)
+---
+
+## 2) Session and Action Bar
+
+Top actions available from the main window:
+
+- **Session selector**: choose existing saved session.
+- **Load Session**: restore detections/watchlist/session state.
+- **Save Session**: persist current operation state.
+- **Download Report**: export HTML report.
+- **Export as PDF**: generate PDF report.
+- **START / STOP PREVIEW** and **STOP PREVIEW**: monitor controls.
+- **Open LAB**: switch/focus Lab workflow.
+- **Error Log**: inspect runtime errors.
+
+---
+
+## 3) Monitor Tab
+
+### RF Control Panel
+
+- Preset profile selector (433 / 868 / 915 ranges).
+- Center frequency input.
+- Sample-rate input/slider.
+- Gain control.
+- Alert threshold control.
+- Active frequency and hopping controls.
+
+### Visualization Area
+
+- Waterfall history view.
+- Spectrum curve overlay.
+- Mouse wheel zoom.
+- Click-drag pan.
+
+### Detection and Context Panels
+
+- Live detections table with frequency, modulation, baud, label/protocol, strength, duration, and timestamp.
+- Watchlist list management (add/remove).
+- Offline IQ file drop zone (drag-and-drop + browse).
+
+---
+
+## 4) Lab Tab
+
+The Lab tab is optimized for post-capture signal intelligence workflows:
+
+- Raw IQ capture control with power indexing.
+- Indexed event browsing.
+- Extracted event-window inspection.
+- Modulation/baud estimation summary.
+- Signature/rolling-code oriented analysis flow.
+
+Use Lab when you need to explain **why** a detection happened, not just confirm that it happened.
+
+---
+
+## 5) Recommended Operator Routine
+
+1. Verify header health.
+2. Configure RF controls.
+3. Start monitor scan.
+4. Track detections and maintain watchlist.
+5. Save session snapshots during important windows.
+6. Export report artifacts.
+7. Move to Lab for deeper forensic analysis when needed.
