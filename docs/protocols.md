@@ -1,34 +1,78 @@
-# Adding Built-in Protocol Definitions
+# Protocol and Signature Definitions
 
-The backend can recognise simple protocols by matching fixed binary headers.
-Protocol definitions live in [`backend/protocols.py`](../backend/protocols.py).
-Each definition provides:
+BladeEye uses two complementary mechanisms for signal interpretation:
 
-- `name`: Human readable protocol name.
-- `header`: Bit string that must match the start of a decoded transmission.
-- `fields`: Mapping of field names to `(start, length)` tuples indicating
-  the bit slice to extract when the header matches.
+1. **Protocol definitions** (structured bit/header matching).
+2. **RF signature matching** (feature-based identification from captured IQ behavior).
+
+---
+
+## 1) Built-in Protocol Definitions
+
+Protocol definitions are maintained in `backend/protocols.py`.
+
+Each protocol entry provides:
+
+- `name`: human-readable protocol name.
+- `header`: expected bit prefix.
+- `fields`: mapping of decoded field names to `(start, length)` slices.
+
+Example:
 
 ```python
 ProtocolDefinition(
     name="ExampleProto",
-    header="1010",          # expected header bits
-    fields={"payload": (4, 8)},  # field name -> (start, length)
+    header="1010",
+    fields={"payload": (4, 8)},
 )
 ```
 
-To add a new protocol:
+### Adding a new protocol definition
 
-1. Append a new `ProtocolDefinition` to the `PROTOCOLS` list in
-   `backend/protocols.py` with the appropriate header and fields.
-2. Ensure any additional metadata required by the protocol is represented as
-   fields so it can be returned by the `identify_protocol()` helper.
-3. Run the test suite (`pytest` and `npm test` in `frontend/`) to verify the
-   new definition works as expected.
+1. Add a new `ProtocolDefinition` to `PROTOCOLS` in `backend/protocols.py`.
+2. Define all required decoded fields in `fields`.
+3. Validate through tests (`pytest`) and relevant frontend checks (`npm test` in `frontend/`).
 
-The API's `/api/signals/{frequency}/decode` endpoint automatically uses
-`identify_protocol` on decoded bitstrings and exposes the protocol name and
-fields in both the response JSON and the in-memory `Signal` object.
+---
 
+## 2) Signature-Based Identification
 
-For a complete inventory of integrated RF devices and protocol definitions, see `docs/integrated_devices_and_protocols.md`.
+Signature logic and data are provided through the backend intelligence modules (for example `backend/signatures_data.py` and related engine code). Typical outcomes include:
+
+- protocol hints,
+- likely-purpose annotations,
+- confidence-aware classification context.
+
+Signature matching is especially useful when a strict protocol header match is unavailable.
+
+---
+
+## 3) Monitor vs Lab Usage
+
+- **Monitor** applies fast classification/intelligence for live operational awareness.
+- **Lab** enables deeper post-capture analysis and validation of signal behavior, including rolling-code related investigations.
+
+Use both in sequence for highest confidence:
+
+1. detect live in Monitor,
+2. validate and refine in Lab,
+3. feed findings back into signatures/protocol definitions.
+
+---
+
+## 4) Validation Checklist for New Definitions
+
+When adding protocols or signature rules, verify:
+
+- correct bit-header alignment,
+- field extraction boundaries,
+- no regressions in existing detections,
+- expected API payload shape,
+- report output correctness.
+
+Minimum recommended checks:
+
+```bash
+pytest -q
+cd frontend && npm test
+```

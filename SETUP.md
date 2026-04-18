@@ -1,52 +1,108 @@
 # Setup Guide
 
-This guide explains how to install the required software for the passive monitoring script and how to verify that your SDR hardware is detected by the system.
+This guide describes installation requirements and hardware verification for the current BladeEye desktop runtime.
 
-## Required Packages
+## 1) System Requirements
 
-- **GNU Radio**: version 3.8 or later (tested with 3.8.1.0).
-- **gr-osmosdr**: provides the `osmosdr` source and sink blocks.
-  **BladeRF drivers** (`bladerf` packages).
+- Python 3.10+
+- `pip` and virtual environment support
+- SDR dependencies for live capture workflows:
+  - GNU Radio (3.8+)
+  - `gr-osmosdr`
+  - BladeRF runtime/driver packages (`bladerf`, `libbladerf`)
 
-## Installation
+> You can still run parts of the application without SDR hardware (for UI and development workflows), but live RF capture requires a compatible SDR stack.
 
-Below are example commands for common Linux distributions. These commands require root privileges (`sudo`).
+---
+
+## 2) Python Environment
+
+From repository root:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+---
+
+## 3) SDR Packages (Linux Examples)
 
 ### Debian/Ubuntu
 
 ```bash
 sudo apt update
-sudo apt install gnuradio gr-osmosdr bladerf libbladerf2 libbladerf-dev \
-    python3-matplotlib
+sudo apt install gnuradio gr-osmosdr bladerf libbladerf2 libbladerf-dev python3-matplotlib
 ```
 
 ### Fedora
 
 ```bash
-sudo dnf install gnuradio gr-osmosdr bladerf bladerf-devel \
-    python3-matplotlib
+sudo dnf install gnuradio gr-osmosdr bladerf bladerf-devel python3-matplotlib
 ```
 
 ### Arch Linux
 
 ```bash
-sudo pacman -Syu gnuradio gr-osmosdr bladerf libbladerf \
-    python-matplotlib
+sudo pacman -Syu gnuradio gr-osmosdr bladerf libbladerf python-matplotlib
 ```
 
-## Hardware Connection and Verification
+---
 
-1. Connect your BladeRF device via USB.
-2. Verify the connection:
-   - **BladeRF**:
-     ```bash
-     bladeRF-cli --probe
-     ```
-     This lists detected BladeRF devices.
-3. If your user does not have permission to access the device, run the command with `sudo` or install the appropriate udev rules provided by the device packages.
+## 4) Hardware Verification
 
-Once the device is detected correctly you can proceed with the scripts in this repository.
+1. Connect the BladeRF via USB.
+2. Probe the device:
 
-## Configuration
+```bash
+bladeRF-cli --probe
+```
 
-All runtime configuration is handled within the application's ControlPanel.
+If the device is not accessible:
+
+- run with elevated privileges for a quick test, or
+- install/configure appropriate udev permissions for permanent non-root access.
+
+---
+
+## 5) Launch BladeEye Desktop
+
+```bash
+python main.py
+```
+
+Optional explicit configuration:
+
+```bash
+python main.py --desktop-pro --center-freq 868000000 --sample-rate 5000000 --gain 32
+```
+
+---
+
+## 6) Optional Build Optimizations
+
+Build Cython helper for optional demodulation speedups:
+
+```bash
+python backend/setup.py build_ext --inplace
+```
+
+---
+
+## 7) Post-Install Validation
+
+Recommended checks:
+
+```bash
+pytest -q tests/test_bladeeye_pro_core.py tests/test_capture_lab.py
+```
+
+If frontend/API integration is part of your workflow:
+
+```bash
+cd frontend
+npm ci
+npm test
+```
