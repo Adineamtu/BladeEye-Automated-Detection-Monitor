@@ -221,7 +221,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.export_report_btn.clicked.connect(self._export_report)
         self.export_pdf_btn = QtWidgets.QPushButton('Export as PDF')
         self.export_pdf_btn.clicked.connect(self._export_pdf)
-        self.start_btn = QtWidgets.QPushButton('START / STOP PREVIEW')
+        self.start_btn = QtWidgets.QPushButton('START PREVIEW')
         self.start_btn.clicked.connect(self.start)
         self.stop_btn = QtWidgets.QPushButton('STOP PREVIEW')
         self.stop_btn.clicked.connect(self.stop)
@@ -248,6 +248,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
         self.tabs = QtWidgets.QTabWidget(self)
         layout.addWidget(self.tabs, stretch=1)
+        self.tabs.tabBar().hide()
         monitor_tab = QtWidgets.QWidget(self)
         monitor_layout = QtWidgets.QVBoxLayout(monitor_tab)
         lab_tab = QtWidgets.QWidget(self)
@@ -255,23 +256,26 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
         controls = QtWidgets.QHBoxLayout()
         self.preset_combo = QtWidgets.QComboBox()
-        self.preset_combo.addItems(['wideband 433 MHz', 'Europe 868 MHz', '915 MHz ISM'])
+        self.preset_combo.addItems(['wideband 433 MHz', 'Europe 868 MHz', '915 MHz ISM', 'Manual / Custom'])
         self.preset_combo.currentTextChanged.connect(self._apply_preset)
 
         self.freq_spin = QtWidgets.QDoubleSpinBox()
         self.freq_spin.setRange(1.0, 6000.0)
         self.freq_spin.setValue(config.center_freq / 1e6)
         self.freq_spin.setSuffix(' MHz')
+        self.freq_spin.lineEdit().setReadOnly(True)
         self.freq_spin.valueChanged.connect(lambda v: self._retune(v * 1e6))
 
         self.sample_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.sample_slider.setRange(1, 40)
         self.sample_slider.setValue(int(config.sample_rate / 1e6))
+        self.sample_slider.setMinimumWidth(120)
         self.sample_slider.valueChanged.connect(self._change_sample_rate)
 
         self.gain_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.gain_slider.setRange(0, 70)
         self.gain_slider.setValue(int(config.gain))
+        self.gain_slider.setMinimumWidth(120)
         self.gain_slider.valueChanged.connect(lambda v: self.acquisition.update_params(gain=float(v)))
 
         self.alert_threshold = QtWidgets.QDoubleSpinBox()
@@ -294,6 +298,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.wf_intensity_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.wf_intensity_slider.setRange(-80, 80)
         self.wf_intensity_slider.setValue(-12)
+        self.wf_intensity_slider.setMinimumWidth(120)
         self.wf_intensity_slider.valueChanged.connect(self._set_waterfall_intensity)
 
         for label, widget in (
@@ -431,6 +436,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             'Europe 868 MHz': 868_300_000.0,
             '915 MHz ISM': 915_000_000.0,
         }
+        is_manual = text == 'Manual / Custom'
+        self.freq_spin.lineEdit().setReadOnly(not is_manual)
         if text in presets:
             self.freq_spin.setValue(presets[text] / 1e6)
             self.alert_threshold.setValue(50_000.0)
@@ -548,7 +555,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
 
     def _process_chunk(self, chunk: np.ndarray):
         with self._dsp_lock:
-            return self.dsp.process(chunk)
+            return self.dsp.process(chunk, deep_analysis=False)
 
     def _refresh_ui(self) -> None:
         frame = self.sdr_worker.pop_latest_frame()
@@ -595,9 +602,9 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         rows = [all_rows[idx] for idx in self._visible_detection_indices]
         self.table.setRowCount(len(rows))
         for r, evt in enumerate(rows):
-            baud_display = f'{evt.baud_rate:.1f}' if evt.baud_rate > 0 else 'Pending Lab'
-            purpose_display = evt.purpose if evt.purpose else 'Pending Lab'
-            protocol_display = evt.protocol if evt.protocol else 'Pending Lab'
+            baud_display = f'{evt.baud_rate:.1f}' if evt.baud_rate > 0 else '---'
+            purpose_display = evt.purpose if evt.purpose else 'Record to Analyze'
+            protocol_display = evt.protocol if evt.protocol else 'Record to Analyze'
             values = [
                 f'{evt.center_freq:.0f}',
                 evt.modulation,
@@ -657,7 +664,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             self.iq_info.setText('Nu există fragment IQ disponibil pentru această detecție.')
             return
         with self._dsp_lock:
-            frame = self.dsp.process(iq[: max(self.dsp.fft_size, 4096)])
+            frame = self.dsp.process(iq[: max(self.dsp.fft_size, 4096)], deep_analysis=True)
         event = list(self.detections)[source_idx]
         mod = frame.event.modulation if frame.event else event.modulation
         snr = float(np.max(frame.fft_db) - np.median(frame.fft_db))
@@ -735,12 +742,12 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             f'Time: {datetime.fromtimestamp(event.timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}',
             f'Frequency: {event.center_freq / 1e6:.6f} MHz ({event.center_freq:.0f} Hz)',
             f'Modulation: {event.modulation}',
-            (f'Baud: {event.baud_rate:.1f}' if event.baud_rate > 0 else 'Baud: Pending Lab'),
+            (f'Baud: {event.baud_rate:.1f}' if event.baud_rate > 0 else 'Baud: ---'),
             f'RSSI/Strength: {event.signal_strength:.5f}',
             f'Duration: {event.duration_s:.6f} s',
             f'Label: {event.label}',
             f'Purpose: {event.purpose}',
-            f'Protocol: {event.protocol or "Pending Lab"}',
+            f'Protocol: {event.protocol or "Record to Analyze"}',
             f'Confidence: {event.confidence * 100:.1f}%',
             f'Raw Hex: {event.raw_hex or "(not available)"}',
         ]
@@ -932,7 +939,7 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
             if data.size == 0:
                 raise ValueError('file empty')
             with self._dsp_lock:
-                frame = self.dsp.process(data[: max(self.dsp.fft_size, 4096)])
+                frame = self.dsp.process(data[: max(self.dsp.fft_size, 4096)], deep_analysis=True)
             mod = frame.event.modulation if frame.event else 'NOISE'
             snr = float(np.max(frame.fft_db) - np.median(frame.fft_db))
             baud = frame.event.baud_rate if frame.event else 0.0
