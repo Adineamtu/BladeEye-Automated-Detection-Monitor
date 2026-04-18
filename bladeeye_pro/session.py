@@ -15,6 +15,7 @@ class ProSession:
     config: dict[str, Any]
     watchlist: list[float] = field(default_factory=list)
     detections: list[dict[str, Any]] = field(default_factory=list)
+    runtime_source: str = "local"
 
     @classmethod
     def from_runtime(
@@ -24,12 +25,14 @@ class ProSession:
         config: HardwareConfig,
         watchlist: list[float],
         detections: list[DetectionEvent],
+        runtime_source: str = "local",
     ) -> "ProSession":
         return cls(
             name=name,
             config=asdict(config),
             watchlist=[float(freq) for freq in watchlist],
             detections=[asdict(det) for det in detections],
+            runtime_source=("sidecar" if str(runtime_source).strip().lower() == "sidecar" else "local"),
         )
 
 

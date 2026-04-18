@@ -89,6 +89,8 @@ class AsyncRawCaptureLogger:
         self._events: list[PowerIndexEvent] = []
         self._lock = threading.Lock()
         self._pre_trigger_ring: deque[np.complex64] = deque(maxlen=max(1, self._pre_trigger_samples or 1))
+        self._noise_floor = 1e-6
+        self._noise_alpha = 0.02
 
     @property
     def bytes_written(self) -> int:
@@ -166,7 +168,9 @@ class AsyncRawCaptureLogger:
                     self._bytes_written += int(chunk.nbytes)
                 rssi = float(np.mean(np.abs(chunk) ** 2)) if chunk.size else 0.0
                 peak_power = float(np.max(np.abs(chunk) ** 2)) if chunk.size else 0.0
-                if rssi >= self.power_threshold:
+                self._noise_floor = ((1.0 - self._noise_alpha) * self._noise_floor) + (self._noise_alpha * rssi)
+                dynamic_threshold = max(self._noise_floor * max(1.0, self.power_threshold), self._noise_floor * 1.05)
+                if rssi >= dynamic_threshold:
                     event_sample_index = self._sample_cursor - int(chunk.size)
                     pre_trigger_start = max(0, event_sample_index - self._pre_trigger_samples)
                     self._events.append(
@@ -186,6 +190,7 @@ class AsyncRawCaptureLogger:
             "version": 1,
             "sample_rate": self.sample_rate,
             "power_threshold": self.power_threshold,
+            "noise_floor": self._noise_floor,
             "pre_trigger_ms": self.pre_trigger_ms,
             "capture_file": str(self.output_path),
             "bytes_written": self.bytes_written,
@@ -211,6 +216,58 @@ class PowerIndexAnalyzer:
             window = self.extract_event_window(event, pre_seconds=pre_seconds, post_seconds=post_seconds)
             if window.size:
                 yield event, window
+
+    def scan_entire_file_for_energy(
+        self,
+        *,
+        threshold_multiplier: float = 2.5,
+        min_event_gap_ms: float = 80.0,
+        chunk_samples: int = 8192,
+        persist: bool = True,
+    ) -> list[dict]:
+        """Reindex capture by scanning full IQ file for energy events."""
+        chunk_samples = max(512, int(chunk_samples))
+        threshold_multiplier = max(1.0, float(threshold_multiplier))
+        min_event_gap_samples = int(max(0.0, min_event_gap_ms) * self.sample_rate / 1000.0)
+        noise_floor = 1e-6
+        noise_alpha = 0.02
+        events: list[dict] = []
+        last_event_sample = -min_event_gap_samples
+        sample_cursor = 0
+        itemsize = np.dtype(np.complex64).itemsize
+        pre_trigger_samples = int((self.pre_trigger_ms / 1000.0) * self.sample_rate)
+
+        with self.capture_path.open("rb") as fh:
+            while True:
+                chunk = np.fromfile(fh, dtype=np.complex64, count=chunk_samples)
+                if chunk.size == 0:
+                    break
+                rssi = float(np.mean(np.abs(chunk) ** 2))
+                peak_power = float(np.max(np.abs(chunk) ** 2))
+                noise_floor = ((1.0 - noise_alpha) * noise_floor) + (noise_alpha * rssi)
+                dynamic_threshold = max(noise_floor * threshold_multiplier, noise_floor * 1.05)
+                if (rssi >= dynamic_threshold) and ((sample_cursor - last_event_sample) >= min_event_gap_samples):
+                    pre_start = max(0, sample_cursor - pre_trigger_samples)
+                    events.append(
+                        {
+                            "byte_offset": sample_cursor * itemsize,
+                            "sample_index": sample_cursor,
+                            "pre_trigger_start_sample": pre_start,
+                            "pre_trigger_samples": pre_trigger_samples,
+                            "timestamp": time.time(),
+                            "rssi": rssi,
+                            "peak_power": peak_power,
+                        }
+                    )
+                    last_event_sample = sample_cursor
+                sample_cursor += int(chunk.size)
+
+        self.index["events"] = events
+        self.index["power_threshold"] = threshold_multiplier
+        self.index["noise_floor"] = noise_floor
+        if persist:
+            self.index_path.write_text(json.dumps(self.index, indent=2), encoding="utf-8")
+        return events
 
     def extract_event_window(self, event: dict, *, pre_seconds: float = 0.1, post_seconds: float = 0.5) -> np.ndarray:
         """Read only the requested IQ slice for one indexed event."""
