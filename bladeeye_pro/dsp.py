@@ -64,7 +64,7 @@ class DSPEngine:
             return "OOK-Remote"
         return "Unknown"
 
-    def process(self, iq: np.ndarray) -> DSPFrame:
+    def process(self, iq: np.ndarray, *, deep_analysis: bool = False) -> DSPFrame:
         iq = np.asarray(iq, dtype=np.complex64)
         if iq.size < self.fft_size:
             padded = np.zeros(self.fft_size, dtype=np.complex64)
@@ -94,11 +94,19 @@ class DSPEngine:
             widths = (stops[: starts.size] - starts[: stops.size]) if starts.size and stops.size else np.array([])
             pulse_width_ms = float(np.mean(widths) / self.sample_rate * 1000.0) if widths.size else 0.0
 
-            mod = ModulationDetector.detect(iq)
-            pulse_gap_ms = float(np.mean(np.diff(starts)) / self.sample_rate * 1000.0) if starts.size > 1 else 0.0
-            label, purpose, confidence = self._classifier.classify(pulse_width_ms, pulse_gap_ms, mod)
-            baud_rate = self._estimate_baud_rate(starts, self.sample_rate)
-            protocol = self._protocol_from_modulation(mod, baud_rate)
+            if deep_analysis:
+                mod = ModulationDetector.detect(iq)
+                pulse_gap_ms = float(np.mean(np.diff(starts)) / self.sample_rate * 1000.0) if starts.size > 1 else pulse_width_ms
+                label, purpose, confidence = self._classifier.classify(pulse_width_ms, pulse_gap_ms, mod)
+                baud_rate = self._estimate_baud_rate(starts, self.sample_rate)
+                protocol = self._protocol_from_modulation(mod, baud_rate)
+            else:
+                mod = 'ENERGY'
+                label = 'Energy Peak'
+                purpose = 'Record to Analyze'
+                confidence = 0.0
+                baud_rate = 0.0
+                protocol = ''
             duration_s = max(pulse_width_ms / 1000.0, 1.0 / self.sample_rate)
             snippet_samples = min(iq.size, max(2048, int(self.sample_rate * 0.006)))
             if starts.size:
