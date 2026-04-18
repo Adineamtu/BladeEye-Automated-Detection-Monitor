@@ -371,7 +371,6 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         self.wf_intensity_slider.valueChanged.connect(self._set_waterfall_intensity)
         self.classic_palette_check = QtWidgets.QCheckBox('Classic Waterfall')
         self.classic_palette_check.setChecked(True)
-        self.classic_palette_check.toggled.connect(self.spectrum.set_palette_mode)
         self.runtime_source_combo = QtWidgets.QComboBox()
         self.runtime_source_combo.addItem('Local pipeline', 'local')
         self.runtime_source_combo.addItem('Sidecar pipeline', 'sidecar')
@@ -405,6 +404,8 @@ class BladeEyeProWindow(QtWidgets.QMainWindow):
         controls.addWidget(self.active_freq)
         controls.addStretch(1)
         self.spectrum = SpectrumWaterfallWidget(self)
+        self.classic_palette_check.toggled.connect(self.spectrum.set_palette_mode)
+        self.spectrum.set_palette_mode(self.classic_palette_check.isChecked())
         monitor_layout.addWidget(self.spectrum, stretch=5)
         monitor_layout.addLayout(controls)
 
